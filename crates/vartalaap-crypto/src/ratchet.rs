@@ -10,6 +10,7 @@
 //! Wire format for a ciphertext is a single message-type byte followed by the
 //! Olm ciphertext bytes (see [`OlmMessage::to_parts`]).
 
+use serde::{Deserialize, Serialize};
 use vodozemac::olm::{Account, OlmMessage, Session, SessionConfig};
 use vodozemac::Curve25519PublicKey;
 
@@ -70,7 +71,7 @@ impl MessagingAccount {
 }
 
 /// Public bundle published by a peer so others can initiate a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     pub identity_key: [u8; 32],
     pub one_time_key: [u8; 32],
