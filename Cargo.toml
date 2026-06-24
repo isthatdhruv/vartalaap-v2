@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# The Tauri app builds separately (its own Cargo.lock/target): `generate_context!`
+# embeds the built frontend, which would break workspace-wide cargo commands.
+exclude = ["app"]
 
 [workspace.package]
 edition = "2021"
