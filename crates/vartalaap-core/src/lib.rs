@@ -76,6 +76,17 @@ impl Engine {
         self.identity.public_id().fingerprint()
     }
 
+    /// The raw 32-byte public id.
+    pub fn id_bytes(&self) -> [u8; 32] {
+        self.identity.public_id().to_bytes()
+    }
+
+    /// The 32-byte identity seed, used to derive the network keypair so the
+    /// node's PeerId equals its Vartalaap ID.
+    pub fn identity_seed(&self) -> [u8; 32] {
+        *self.identity.secret_bytes()
+    }
+
     /// Sign and persist a new profile.
     pub fn set_profile(&self, profile: Profile) -> Result<(), CoreError> {
         let signed = self.identity.sign_profile(profile);

@@ -12,17 +12,21 @@
 //! an `.await`, and never both held at once, so there is no deadlock or blocked
 //! reactor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
+use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use vartalaap_crypto::ratchet::{MessagingAccount, PreKeyBundle, RatchetSession};
-use vartalaap_identity::Identity;
-use vartalaap_net::{peer_id_from_bytes, Conn, IrohTransport};
+use vartalaap_identity::{Identity, Profile};
+use vartalaap_net::{peer_id_bytes, peer_id_from_bytes, Conn, IrohTransport, PeerEvent};
 use vartalaap_sync::{Conversation, Message};
+
+use crate::Engine;
 
 /// A peer's stable id: the 32-byte Vartalaap ID / Iroh PeerId.
 pub type PeerKey = [u8; 32];
@@ -40,6 +44,8 @@ pub enum EngineEvent {
     PresenceChanged { peer: PeerKey, online: bool },
     /// `peer` has read everything up to `up_to` (a lamport watermark).
     ReadReceipt { peer: PeerKey, up_to: u64 },
+    /// A peer appeared on the LAN (via mDNS), available to connect to.
+    PeerDiscovered(PeerKey),
 }
 
 /// Frames exchanged on the wire (JSON-encoded).
@@ -69,6 +75,8 @@ struct State {
     conns: HashMap<PeerKey, Conn>,
     /// Trust-on-first-use: the key we pinned for each peer.
     pinned: HashMap<PeerKey, PeerKey>,
+    /// Peers currently visible on the LAN via mDNS.
+    discovered: BTreeSet<PeerKey>,
 }
 
 /// A running Vartalaap node.
@@ -78,13 +86,34 @@ pub struct Node {
     transport: Arc<IrohTransport>,
     state: Arc<Mutex<State>>,
     events: mpsc::UnboundedSender<EngineEvent>,
+    /// Present when started with persistence; owns identity/profile/store.
+    engine: Option<Arc<Engine>>,
 }
 
 impl Node {
-    /// Start a node from a 32-byte identity seed. Binds the LAN transport with
-    /// discovery and starts accepting connections. Returns the node and a
-    /// receiver of [`EngineEvent`]s.
+    /// Start an in-memory node from a 32-byte identity seed (no persistence).
+    /// Mainly for tests; the app uses [`Node::start_persistent`].
     pub async fn start(seed: [u8; 32]) -> Result<(Self, mpsc::UnboundedReceiver<EngineEvent>)> {
+        Self::start_inner(seed, None).await
+    }
+
+    /// Start a node backed by a persistent, encrypted identity + profile store
+    /// rooted at `data_dir` and unlocked with `passphrase`. The networking
+    /// keypair is derived from the stored identity, so the PeerId equals the
+    /// Vartalaap ID across restarts.
+    pub async fn start_persistent(
+        data_dir: &Path,
+        passphrase: &str,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<EngineEvent>)> {
+        let engine = Engine::open(data_dir, passphrase)?;
+        let seed = engine.identity_seed();
+        Self::start_inner(seed, Some(Arc::new(engine))).await
+    }
+
+    async fn start_inner(
+        seed: [u8; 32],
+        engine: Option<Arc<Engine>>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<EngineEvent>)> {
         let id = Identity::from_secret_bytes(seed).public_id().to_bytes();
         let transport = Arc::new(IrohTransport::bind_with_discovery(seed).await?);
         let messaging = Arc::new(Mutex::new(MessagingAccount::new()));
@@ -109,6 +138,38 @@ impl Node {
             });
         }
 
+        // Discovery loop: surface peers appearing/leaving on the LAN.
+        {
+            let transport = transport.clone();
+            let state = state.clone();
+            let events = tx.clone();
+            tokio::spawn(async move {
+                if let Some(mut stream) = transport.peer_events().await {
+                    while let Some(ev) = stream.next().await {
+                        match ev {
+                            PeerEvent::Discovered(pid) => {
+                                let key = peer_id_bytes(&pid);
+                                if key == id {
+                                    continue; // ignore ourselves
+                                }
+                                let is_new = state.lock().unwrap().discovered.insert(key);
+                                if is_new {
+                                    let _ = events.send(EngineEvent::PeerDiscovered(key));
+                                }
+                            }
+                            PeerEvent::Expired(pid) => {
+                                state
+                                    .lock()
+                                    .unwrap()
+                                    .discovered
+                                    .remove(&peer_id_bytes(&pid));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Ok((
             Node {
                 id,
@@ -116,6 +177,7 @@ impl Node {
                 transport,
                 state,
                 events: tx,
+                engine,
             },
             rx,
         ))
@@ -124,6 +186,50 @@ impl Node {
     /// This node's Vartalaap ID.
     pub fn id(&self) -> PeerKey {
         self.id
+    }
+
+    /// Peers currently visible on the LAN.
+    pub fn discovered_peers(&self) -> Vec<PeerKey> {
+        self.state
+            .lock()
+            .unwrap()
+            .discovered
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// A snapshot of the full ordered messages in the conversation with `peer`.
+    pub fn conversation(&self, peer: &PeerKey) -> Vec<Message> {
+        let st = self.state.lock().unwrap();
+        match st.conversations.get(peer) {
+            None => Vec::new(),
+            Some(conv) => conv.messages_ordered().into_iter().cloned().collect(),
+        }
+    }
+
+    /// The human-facing Vartalaap ID fingerprint, if persistence is enabled.
+    pub fn fingerprint(&self) -> Option<String> {
+        self.engine.as_ref().map(|e| e.vartalaap_id())
+    }
+
+    /// The stored profile, if persistence is enabled and one is set.
+    pub fn profile(&self) -> Result<Option<Profile>> {
+        match &self.engine {
+            Some(e) => Ok(e.profile()?),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a new profile (requires persistence).
+    pub fn set_profile(&self, profile: Profile) -> Result<()> {
+        match &self.engine {
+            Some(e) => {
+                e.set_profile(profile)?;
+                Ok(())
+            }
+            None => Err(anyhow!("this node has no persistent store")),
+        }
     }
 
     /// Connect to a peer by Vartalaap ID, performing the handshake. Resolves the
