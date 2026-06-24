@@ -31,7 +31,9 @@ impl Store {
     /// Open (or create) the database at `path`, encrypting values with `key`.
     pub fn open(path: &Path, key: VaultKey) -> Result<Self, StoreError> {
         let db = Database::create(path).map_err(|e| StoreError::Db(e.to_string()))?;
-        let wtx = db.begin_write().map_err(|e| StoreError::Db(e.to_string()))?;
+        let wtx = db
+            .begin_write()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
         {
             let _ = wtx
                 .open_table(SECRETS)
@@ -44,7 +46,10 @@ impl Store {
     /// Seal and store raw bytes under `name`.
     pub fn put_secret(&self, name: &str, plaintext: &[u8]) -> Result<(), StoreError> {
         let blob = seal(&self.key, plaintext);
-        let wtx = self.db.begin_write().map_err(|e| StoreError::Db(e.to_string()))?;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
         {
             let mut t = wtx
                 .open_table(SECRETS)
@@ -58,7 +63,10 @@ impl Store {
 
     /// Read and decrypt bytes stored under `name`, if present.
     pub fn get_secret(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let rtx = self.db.begin_read().map_err(|e| StoreError::Db(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
         let t = rtx
             .open_table(SECRETS)
             .map_err(|e| StoreError::Db(e.to_string()))?;
