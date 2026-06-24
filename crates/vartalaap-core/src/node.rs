@@ -34,15 +34,30 @@ pub enum EngineEvent {
     PeerConnected(PeerKey),
     /// A decrypted application message arrived from `peer`.
     MessageReceived { peer: PeerKey, message: Message },
+    /// `peer` is currently typing.
+    Typing(PeerKey),
+    /// `peer`'s presence changed.
+    PresenceChanged { peer: PeerKey, online: bool },
+    /// `peer` has read everything up to `up_to` (a lamport watermark).
+    ReadReceipt { peer: PeerKey, up_to: u64 },
 }
 
 /// Frames exchanged on the wire (JSON-encoded).
+///
+/// `Hello`/`Message` are the durable protocol; the rest are ephemeral gossip
+/// (not persisted to the CRDT), carried inside the already-encrypted transport.
 #[derive(Serialize, Deserialize)]
 enum Wire {
     /// Sent once per connection: the sender's pre-key bundle.
     Hello { bundle: PreKeyBundle },
     /// A ratchet-encrypted [`Message`] payload.
     Message { ciphertext: Vec<u8> },
+    /// The sender is typing (ephemeral).
+    Typing,
+    /// The sender's presence (ephemeral).
+    Presence { online: bool },
+    /// The sender has read up to this lamport watermark (ephemeral).
+    Read { up_to: u64 },
 }
 
 #[derive(Default)]
@@ -175,6 +190,39 @@ impl Node {
         }
     }
 
+    /// Send a frame to a connected peer.
+    async fn send_to(&self, peer: PeerKey, wire: &Wire) -> Result<()> {
+        let conn = {
+            let st = self.state.lock().unwrap();
+            st.conns.get(&peer).cloned()
+        }
+        .ok_or_else(|| anyhow!("no connection to peer"))?;
+        conn.send_frame(&serde_json::to_vec(wire)?).await?;
+        Ok(())
+    }
+
+    /// Tell a peer we are typing (ephemeral).
+    pub async fn notify_typing(&self, peer: PeerKey) -> Result<()> {
+        self.send_to(peer, &Wire::Typing).await
+    }
+
+    /// Tell a peer our presence changed (ephemeral).
+    pub async fn set_presence(&self, peer: PeerKey, online: bool) -> Result<()> {
+        self.send_to(peer, &Wire::Presence { online }).await
+    }
+
+    /// Record locally that we've read up to `up_to`, and tell the peer.
+    pub async fn mark_read(&self, peer: PeerKey, up_to: u64) -> Result<()> {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.conversations
+                .entry(peer)
+                .or_default()
+                .mark_read(self.id, up_to);
+        }
+        self.send_to(peer, &Wire::Read { up_to }).await
+    }
+
     /// A snapshot of the messages in the conversation with `peer`, ordered.
     pub fn conversation_bodies(&self, peer: &PeerKey) -> Vec<String> {
         let st = self.state.lock().unwrap();
@@ -215,7 +263,7 @@ async fn setup_connection(
             st.conns.insert(peer, conn.clone());
             st.conversations.entry(peer).or_default();
         }
-        Wire::Message { .. } => return Err(anyhow!("expected Hello as first frame")),
+        _ => return Err(anyhow!("expected Hello as first frame")),
     }
     let _ = events.send(EngineEvent::PeerConnected(peer));
 
@@ -259,6 +307,22 @@ async fn reader_loop(
                     }
                     let _ = events.send(EngineEvent::MessageReceived { peer, message });
                 }
+            }
+            Wire::Typing => {
+                let _ = events.send(EngineEvent::Typing(peer));
+            }
+            Wire::Presence { online } => {
+                let _ = events.send(EngineEvent::PresenceChanged { peer, online });
+            }
+            Wire::Read { up_to } => {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.conversations
+                        .entry(peer)
+                        .or_default()
+                        .mark_read(peer, up_to);
+                }
+                let _ = events.send(EngineEvent::ReadReceipt { peer, up_to });
             }
         }
     }
@@ -353,6 +417,60 @@ mod tests {
             "conversations must converge"
         );
         assert_eq!(alice.conversation_bodies(&bob_id).len(), 2);
+
+        Ok(())
+    }
+
+    /// Drain events until one matches `pred` (or time out).
+    async fn wait_for(
+        rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
+        pred: impl Fn(&EngineEvent) -> bool,
+    ) -> EngineEvent {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match rx.recv().await {
+                    Some(e) if pred(&e) => return e,
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for event")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn presence_typing_and_read_receipts() -> Result<()> {
+        let (alice, _alice_rx) = Node::start([13u8; 32]).await?;
+        let (bob, mut bob_rx) = Node::start([14u8; 32]).await?;
+        let alice_id = alice.id();
+        let bob_id = bob.id();
+
+        timeout(Duration::from_secs(20), alice.connect(bob_id))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+
+        // Typing indicator propagates.
+        alice.notify_typing(bob_id).await?;
+        wait_for(
+            &mut bob_rx,
+            |e| matches!(e, EngineEvent::Typing(p) if *p == alice_id),
+        )
+        .await;
+
+        // Presence propagates.
+        alice.set_presence(bob_id, true).await?;
+        wait_for(&mut bob_rx, |e| {
+            matches!(e, EngineEvent::PresenceChanged { peer, online } if *peer == alice_id && *online)
+        })
+        .await;
+
+        // Read receipt propagates and updates Bob's view of Alice's read state.
+        alice.mark_read(bob_id, 7).await?;
+        wait_for(&mut bob_rx, |e| {
+            matches!(e, EngineEvent::ReadReceipt { peer, up_to } if *peer == alice_id && *up_to == 7)
+        })
+        .await;
 
         Ok(())
     }
