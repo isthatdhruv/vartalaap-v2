@@ -1,0 +1,279 @@
+:root {
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel-2: #1c2230;
+  --line: #2a313c;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #6d6afe;
+  --accent-2: #2ea043;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.me {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), #9b5cf6);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 18px;
+  flex: none;
+}
+
+.me-info {
+  min-width: 0;
+}
+
+.name-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.display-name {
+  font-weight: 600;
+}
+
+.edit-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.name-edit {
+  display: flex;
+  gap: 6px;
+}
+
+.name-edit input {
+  flex: 1;
+  min-width: 0;
+}
+
+.vid {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.section-title {
+  padding: 14px 16px 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.peers {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.peer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.peer:hover {
+  background: var(--panel-2);
+}
+
+.peer.active {
+  background: var(--panel-2);
+  outline: 1px solid var(--accent);
+}
+
+.peer-id {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #495057;
+  flex: none;
+}
+
+.dot.on {
+  background: var(--accent-2);
+  box-shadow: 0 0 6px var(--accent-2);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 10px;
+  font-size: 13px;
+}
+
+.brand {
+  padding: 12px 16px;
+  font-size: 11px;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+}
+
+/* Chat */
+.chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.enc-badge {
+  font-size: 12px;
+  color: var(--accent-2);
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bubble {
+  max-width: 64%;
+  padding: 9px 13px;
+  border-radius: 14px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble.mine {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+.bubble.theirs {
+  align-self: flex-start;
+  background: var(--panel-2);
+  border-bottom-left-radius: 4px;
+}
+
+.bubble.typing {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.composer {
+  display: flex;
+  gap: 10px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.composer input {
+  flex: 1;
+}
+
+input {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+  outline: none;
+}
+
+input:focus {
+  border-color: var(--accent);
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+.placeholder {
+  margin: auto;
+  text-align: center;
+  color: var(--muted);
+  padding: 40px;
+}
+
+.placeholder h1 {
+  color: var(--text);
+  font-size: 40px;
+  margin: 0 0 8px;
+}
+
+.placeholder .muted {
+  font-size: 13px;
+  opacity: 0.8;
+}

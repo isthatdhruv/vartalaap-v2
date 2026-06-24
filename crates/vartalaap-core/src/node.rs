@@ -232,6 +232,29 @@ impl Node {
         }
     }
 
+    /// The current display name (empty if unset).
+    pub fn display_name(&self) -> String {
+        self.profile()
+            .ok()
+            .flatten()
+            .map(|p| p.display_name)
+            .unwrap_or_default()
+    }
+
+    /// Update just the display name, preserving the rest of the profile.
+    pub fn set_display_name(&self, name: String) -> Result<()> {
+        let mut profile = self.profile()?.unwrap_or(Profile {
+            display_name: String::new(),
+            bio: String::new(),
+            status: String::new(),
+            avatar: None,
+            updated_at: 0,
+        });
+        profile.display_name = name;
+        profile.updated_at = now_millis();
+        self.set_profile(profile)
+    }
+
     /// Connect to a peer by Vartalaap ID, performing the handshake. Resolves the
     /// address over LAN discovery.
     pub async fn connect(&self, peer: PeerKey) -> Result<()> {
