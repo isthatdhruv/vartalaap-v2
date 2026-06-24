@@ -10,6 +10,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use zeroize::Zeroizing;
 
+pub mod ratchet;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("decryption failed")]
