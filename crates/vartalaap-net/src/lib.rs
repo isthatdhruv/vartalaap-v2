@@ -163,8 +163,19 @@ impl IrohTransport {
     }
 }
 
+/// Construct a [`PeerId`] from its raw 32 bytes (e.g. a stored Vartalaap ID).
+pub fn peer_id_from_bytes(bytes: [u8; 32]) -> Result<PeerId> {
+    iroh::PublicKey::from_bytes(&bytes).map_err(any)
+}
+
+/// The raw 32 bytes of a [`PeerId`].
+pub fn peer_id_bytes(id: &PeerId) -> [u8; 32] {
+    *id.as_bytes()
+}
+
 /// An open connection to a peer. Frames are length-delimited (u32 LE length
 /// prefix) and each is carried on its own QUIC bidirectional stream.
+#[derive(Clone)]
 pub struct Conn {
     conn: Connection,
 }
@@ -173,6 +184,11 @@ impl Conn {
     /// The peer on the other end of this connection.
     pub fn remote_id(&self) -> PeerId {
         self.conn.remote_id()
+    }
+
+    /// The raw 32 bytes of the remote peer's id.
+    pub fn remote_id_bytes(&self) -> [u8; 32] {
+        *self.conn.remote_id().as_bytes()
     }
 
     /// Send one length-delimited frame on a fresh bidirectional stream.

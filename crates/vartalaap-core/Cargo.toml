@@ -7,8 +7,15 @@ edition.workspace = true
 vartalaap-identity = { path = "../vartalaap-identity" }
 vartalaap-crypto = { path = "../vartalaap-crypto" }
 vartalaap-store = { path = "../vartalaap-store" }
+vartalaap-net = { path = "../vartalaap-net" }
+vartalaap-sync = { path = "../vartalaap-sync" }
 thiserror = { workspace = true }
 rand = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [dev-dependencies]
 rand = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

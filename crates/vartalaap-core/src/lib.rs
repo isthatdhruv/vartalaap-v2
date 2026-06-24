@@ -12,6 +12,8 @@ use vartalaap_crypto::{derive_key, VaultKey};
 use vartalaap_identity::{Identity, Profile, SignedProfile};
 use vartalaap_store::Store;
 
+pub mod node;
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
