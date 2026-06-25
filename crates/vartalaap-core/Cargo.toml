@@ -9,6 +9,7 @@ vartalaap-crypto = { path = "../vartalaap-crypto" }
 vartalaap-store = { path = "../vartalaap-store" }
 vartalaap-net = { path = "../vartalaap-net" }
 vartalaap-sync = { path = "../vartalaap-sync" }
+vartalaap-blobs = { path = "../vartalaap-blobs" }
 thiserror = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }

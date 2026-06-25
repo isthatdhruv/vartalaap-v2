@@ -1,0 +1,14 @@
+[package]
+name = "vartalaap-blobs"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+vartalaap-crypto = { path = "../vartalaap-crypto" }
+sha2 = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

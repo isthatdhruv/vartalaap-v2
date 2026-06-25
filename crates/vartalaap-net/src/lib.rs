@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use anyhow::Result;
 use futures_lite::{Stream, StreamExt};
 use iroh::address_lookup::{AddressLookup, AddressLookupBuilder, AddressLookupBuilderError};
-use iroh::endpoint::{presets, Connection};
+use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 
@@ -173,8 +173,20 @@ pub fn peer_id_bytes(id: &PeerId) -> [u8; 32] {
     *id.as_bytes()
 }
 
-/// An open connection to a peer. Frames are length-delimited (u32 LE length
-/// prefix) and each is carried on its own QUIC bidirectional stream.
+const TAG_FRAME: u8 = 0;
+const TAG_BLOB: u8 = 1;
+
+/// An incoming stream, classified by its leading tag byte.
+pub enum Incoming {
+    /// A length-delimited control frame (chat protocol).
+    Frame(Vec<u8>),
+    /// A bulk blob transfer (file bytes).
+    Blob(BlobRecv),
+}
+
+/// An open connection to a peer. Each QUIC bidirectional stream begins with a
+/// 1-byte tag: a control frame (length-delimited bytes) or a blob transfer
+/// (length-delimited chunks, 0-length terminator).
 #[derive(Clone)]
 pub struct Conn {
     conn: Connection,
@@ -191,9 +203,10 @@ impl Conn {
         *self.conn.remote_id().as_bytes()
     }
 
-    /// Send one length-delimited frame on a fresh bidirectional stream.
+    /// Send one length-delimited control frame on a fresh stream.
     pub async fn send_frame(&self, data: &[u8]) -> Result<()> {
         let (mut send, _recv) = self.conn.open_bi().await.map_err(any)?;
+        send.write_all(&[TAG_FRAME]).await.map_err(any)?;
         let len = (data.len() as u32).to_le_bytes();
         send.write_all(&len).await.map_err(any)?;
         send.write_all(data).await.map_err(any)?;
@@ -201,15 +214,94 @@ impl Conn {
         Ok(())
     }
 
-    /// Receive one length-delimited frame from the next incoming stream.
-    pub async fn recv_frame(&self) -> Result<Vec<u8>> {
+    /// Open a fresh stream for a bulk blob transfer tagged with `transfer_id`.
+    pub async fn open_blob(&self, transfer_id: [u8; 16]) -> Result<BlobSend> {
+        let (mut send, _recv) = self.conn.open_bi().await.map_err(any)?;
+        send.write_all(&[TAG_BLOB]).await.map_err(any)?;
+        send.write_all(&transfer_id).await.map_err(any)?;
+        Ok(BlobSend { send })
+    }
+
+    /// Accept the next incoming stream and classify it as a frame or a blob.
+    pub async fn accept_incoming(&self) -> Result<Incoming> {
         let (_send, mut recv) = self.conn.accept_bi().await.map_err(any)?;
+        let mut tag = [0u8; 1];
+        recv.read_exact(&mut tag).await.map_err(any)?;
+        match tag[0] {
+            TAG_FRAME => {
+                let mut len_buf = [0u8; 4];
+                recv.read_exact(&mut len_buf).await.map_err(any)?;
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                recv.read_exact(&mut buf).await.map_err(any)?;
+                Ok(Incoming::Frame(buf))
+            }
+            TAG_BLOB => {
+                let mut transfer_id = [0u8; 16];
+                recv.read_exact(&mut transfer_id).await.map_err(any)?;
+                Ok(Incoming::Blob(BlobRecv { transfer_id, recv }))
+            }
+            other => Err(anyhow::anyhow!("unknown stream tag {other}")),
+        }
+    }
+
+    /// Convenience for callers that only expect control frames.
+    pub async fn recv_frame(&self) -> Result<Vec<u8>> {
+        match self.accept_incoming().await? {
+            Incoming::Frame(data) => Ok(data),
+            Incoming::Blob(_) => Err(anyhow::anyhow!("expected a frame, got a blob stream")),
+        }
+    }
+}
+
+/// The send half of a blob transfer.
+pub struct BlobSend {
+    send: SendStream,
+}
+
+impl BlobSend {
+    /// Write one chunk (length-delimited).
+    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        let len = (chunk.len() as u32).to_le_bytes();
+        self.send.write_all(&len).await.map_err(any)?;
+        self.send.write_all(chunk).await.map_err(any)?;
+        Ok(())
+    }
+
+    /// Write the 0-length terminator and finish the stream.
+    pub async fn finish(mut self) -> Result<()> {
+        self.send
+            .write_all(&0u32.to_le_bytes())
+            .await
+            .map_err(any)?;
+        self.send.finish().map_err(any)?;
+        Ok(())
+    }
+}
+
+/// The receive half of a blob transfer.
+pub struct BlobRecv {
+    transfer_id: [u8; 16],
+    recv: RecvStream,
+}
+
+impl BlobRecv {
+    /// The transfer id this stream is carrying.
+    pub fn transfer_id(&self) -> [u8; 16] {
+        self.transfer_id
+    }
+
+    /// The next chunk, or `None` at the terminator.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await.map_err(any)?;
+        self.recv.read_exact(&mut len_buf).await.map_err(any)?;
         let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 {
+            return Ok(None);
+        }
         let mut buf = vec![0u8; len];
-        recv.read_exact(&mut buf).await.map_err(any)?;
-        Ok(buf)
+        self.recv.read_exact(&mut buf).await.map_err(any)?;
+        Ok(Some(buf))
     }
 }
 
@@ -275,6 +367,40 @@ mod tests {
 
         let received = timeout(Duration::from_secs(20), bob_task).await???;
         assert_eq!(received, b"discovered!");
+        alice.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_stream_transfer() -> Result<()> {
+        let bob = IrohTransport::bind([4u8; 32]).await?;
+        let bob_addr = bob.loopback_addr();
+        let bob_task = tokio::spawn(async move {
+            let conn = bob.accept().await?.expect("an incoming connection");
+            match conn.accept_incoming().await? {
+                Incoming::Blob(mut b) => {
+                    let id = b.transfer_id();
+                    let mut data = Vec::new();
+                    while let Some(c) = b.next_chunk().await? {
+                        data.extend_from_slice(&c);
+                    }
+                    anyhow::Ok((id, data))
+                }
+                Incoming::Frame(_) => anyhow::bail!("expected a blob, got a frame"),
+            }
+        });
+
+        let alice = IrohTransport::bind([5u8; 32]).await?;
+        let conn = alice.connect(bob_addr).await?;
+        let tid = [7u8; 16];
+        let mut blob = conn.open_blob(tid).await?;
+        blob.write_chunk(b"hello ").await?;
+        blob.write_chunk(b"world").await?;
+        blob.finish().await?;
+
+        let (got_id, got) = bob_task.await??;
+        assert_eq!(got_id, tid);
+        assert_eq!(got, b"hello world");
         alice.close().await;
         Ok(())
     }
