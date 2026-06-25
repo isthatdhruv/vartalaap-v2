@@ -277,3 +277,84 @@ button:hover {
   font-size: 13px;
   opacity: 0.8;
 }
+
+/* Groups + section header button */
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.mini {
+  padding: 1px 8px;
+  font-size: 14px;
+  line-height: 1.2;
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.group-glyph {
+  width: 9px;
+  text-align: center;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.member-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 1px 7px;
+}
+
+.new-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  margin: 0 8px 8px;
+  background: var(--panel-2);
+  border-radius: 10px;
+}
+
+.pick-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 130px;
+  overflow-y: auto;
+}
+
+.pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pick input {
+  width: auto;
+  padding: 0;
+}
+
+/* File chip in a message bubble */
+.attach {
+  background: var(--panel-2);
+  padding: 8px 12px;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.file-size {
+  font-size: 11px;
+  opacity: 0.75;
+}

@@ -14,6 +14,8 @@ use vartalaap_store::Store;
 
 pub mod node;
 
+pub use vartalaap_sync::{FileRef, Message, MessageKind};
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
