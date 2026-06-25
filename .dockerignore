@@ -1,0 +1,6 @@
+.git
+target
+**/target
+app/node_modules
+app/dist
+node_modules
