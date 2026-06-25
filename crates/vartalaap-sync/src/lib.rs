@@ -24,10 +24,22 @@ pub type MessageId = [u8; 16];
 /// A peer's public identity key, used as the author id.
 pub type AuthorId = [u8; 32];
 
-/// The kind of payload a message carries. Extended in later phases (e.g. files).
+/// A reference to a transferred file (no secret key — that travels separately,
+/// end-to-end, at transfer time).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileRef {
+    pub transfer_id: [u8; 16],
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub sha256: [u8; 32],
+}
+
+/// The kind of payload a message carries.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MessageKind {
     Text,
+    File(FileRef),
 }
 
 /// A single, immutable chat message.
@@ -85,6 +97,23 @@ impl Conversation {
             sent_at,
             body: body.into(),
             kind: MessageKind::Text,
+        };
+        self.messages.insert(id, msg.clone());
+        msg
+    }
+
+    /// Author a new local file message (the file body is its display name).
+    pub fn create_file(&mut self, author: AuthorId, sent_at: u64, file: FileRef) -> Message {
+        self.lamport += 1;
+        let mut id = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+        let msg = Message {
+            id,
+            author,
+            lamport: self.lamport,
+            sent_at,
+            body: file.name.clone(),
+            kind: MessageKind::File(file),
         };
         self.messages.insert(id, msg.clone());
         msg
