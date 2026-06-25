@@ -25,6 +25,10 @@ jobs:
             args: "--bundles deb,appimage"
           - platform: windows-latest
             args: "--bundles nsis"
+          - platform: macos-13 # Intel Macs
+            args: "--bundles dmg"
+          - platform: macos-14 # Apple Silicon Macs
+            args: "--bundles dmg"
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -76,3 +80,4 @@ jobs:
             app/src-tauri/target/release/bundle/deb/*.deb
             app/src-tauri/target/release/bundle/appimage/*.AppImage
             app/src-tauri/target/release/bundle/nsis/*.exe
+            app/src-tauri/target/release/bundle/dmg/*.dmg

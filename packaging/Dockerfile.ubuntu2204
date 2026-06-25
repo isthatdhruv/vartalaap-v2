@@ -20,5 +20,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /src
 COPY . .
 
-# Build the frontend + the .deb bundle.
-RUN cd app && npm ci && npm run tauri build -- --bundles deb
+# AppImage tooling uses FUSE, which isn't available inside a container; this
+# makes appimagetool extract-and-run instead.
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+ENV NO_STRIP=true
+
+# Build the frontend + both Linux bundles (.deb for apt users, .AppImage as the
+# portable single-file build that runs across distros).
+RUN cd app && npm ci && npm run tauri build -- --bundles deb,appimage
