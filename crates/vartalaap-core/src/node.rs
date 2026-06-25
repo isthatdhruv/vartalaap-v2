@@ -39,6 +39,9 @@ pub type PeerKey = [u8; 32];
 pub enum EngineEvent {
     /// A peer connected and completed the handshake (pinned via TOFU).
     PeerConnected(PeerKey),
+    /// A peer's connection closed; the UI should mark it offline and allow a
+    /// fresh dial. Emitted once, for the connection that was actually live.
+    PeerDisconnected(PeerKey),
     /// A decrypted application message arrived from `peer`.
     MessageReceived { peer: PeerKey, message: Message },
     /// `peer` is currently typing.
@@ -121,6 +124,12 @@ struct State {
     /// The most recent pre-key bundle a peer published to us.
     bundles: HashMap<PeerKey, PreKeyBundle>,
     conns: HashMap<PeerKey, Conn>,
+    /// Generation tag of the currently-registered connection per peer, so a
+    /// stale reader loop only evicts *its own* connection on exit (and a newer
+    /// reconnection is never clobbered by an older one shutting down).
+    conn_gen: HashMap<PeerKey, u64>,
+    /// Monotonic source for `conn_gen`.
+    next_gen: u64,
     /// Trust-on-first-use: the key we pinned for each peer.
     pinned: HashMap<PeerKey, PeerKey>,
     /// Peers currently visible on the LAN via mDNS.
@@ -140,6 +149,10 @@ pub struct Node {
     transport: Arc<IrohTransport>,
     state: Arc<Mutex<State>>,
     events: mpsc::UnboundedSender<EngineEvent>,
+    /// Serializes outbound ratchet-session *creation* so two concurrent
+    /// first-sends to the same peer cannot each initiate a distinct session
+    /// (the peer would accept only one and silently drop the other's messages).
+    session_init: Mutex<()>,
     /// Where received files are written.
     download_dir: PathBuf,
     /// Present when started with persistence; owns identity/profile/store.
@@ -242,6 +255,7 @@ impl Node {
                 transport,
                 state,
                 events: tx,
+                session_init: Mutex::new(()),
                 download_dir,
                 engine,
             },
@@ -340,6 +354,15 @@ impl Node {
 
     /// Send a text message to a connected peer, end-to-end encrypted.
     pub async fn send_text(&self, peer: PeerKey, body: &str) -> Result<()> {
+        // Resolve the connection *before* mutating local history, so a send to a
+        // disconnected peer fails cleanly instead of leaving an undelivered
+        // message sitting in our replica looking as if it was sent.
+        let conn = {
+            let st = self.state.lock().unwrap();
+            st.conns.get(&peer).cloned()
+        }
+        .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
+
         let now = now_millis();
         let message = {
             let mut st = self.state.lock().unwrap();
@@ -349,14 +372,7 @@ impl Node {
                 .create_text(self.id, now, body)
         };
         let plaintext = serde_json::to_vec(&Payload::Chat(message))?;
-
         let ciphertext = self.encrypt_for(peer, &plaintext)?;
-
-        let conn = {
-            let st = self.state.lock().unwrap();
-            st.conns.get(&peer).cloned()
-        }
-        .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
 
         let frame = serde_json::to_vec(&Wire::Message { ciphertext })?;
         conn.send_frame(&frame).await?;
@@ -367,6 +383,14 @@ impl Node {
     /// carries the per-file key) travels through the ratchet; the bytes stream
     /// separately, sealed with that key.
     pub async fn send_file(&self, peer: PeerKey, path: &Path) -> Result<()> {
+        // Resolve the connection up front (see `send_text`): no point hashing a
+        // file or recording the offer locally if we can't deliver it.
+        let conn = {
+            let st = self.state.lock().unwrap();
+            st.conns.get(&peer).cloned()
+        }
+        .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
+
         let meta = prepare(path)?;
         let file_ref = FileRef {
             transfer_id: meta.transfer_id,
@@ -388,12 +412,6 @@ impl Node {
         })?;
         let ciphertext = self.encrypt_for(peer, &payload)?;
 
-        let conn = {
-            let st = self.state.lock().unwrap();
-            st.conns.get(&peer).cloned()
-        }
-        .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
-
         // 1) Send the encrypted offer.
         conn.send_frame(&serde_json::to_vec(&Wire::Message { ciphertext })?)
             .await?;
@@ -410,24 +428,36 @@ impl Node {
     /// Encrypt a payload for `peer`, using the existing ratchet session or
     /// initiating a new one from the peer's published bundle.
     fn encrypt_for(&self, peer: PeerKey, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let has_session = self.state.lock().unwrap().sessions.contains_key(&peer);
-        if has_session {
+        // Fast path: an established session already exists.
+        {
             let mut st = self.state.lock().unwrap();
-            let session = st.sessions.get_mut(&peer).unwrap();
-            Ok(session.encrypt(plaintext)?)
-        } else {
-            let bundle = {
-                let st = self.state.lock().unwrap();
-                st.bundles.get(&peer).copied()
+            if let Some(session) = st.sessions.get_mut(&peer) {
+                return Ok(session.encrypt(plaintext)?);
             }
-            .ok_or_else(|| anyhow!("no pre-key bundle for peer; handshake incomplete"))?;
-            let (session, ciphertext) = {
-                let acct = self.messaging.lock().unwrap();
-                RatchetSession::initiate(&acct, &bundle, plaintext)?
-            };
-            self.state.lock().unwrap().sessions.insert(peer, session);
-            Ok(ciphertext)
         }
+        // Slow path: create the outbound session. Hold `session_init` across the
+        // whole check-initiate-insert so two concurrent first-sends serialize:
+        // the loser re-observes the session the winner installed instead of
+        // initiating a *second* session the peer would never accept. (This
+        // method is fully synchronous, so no `.await` is held under the lock.)
+        let _init = self.session_init.lock().unwrap();
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(session) = st.sessions.get_mut(&peer) {
+                return Ok(session.encrypt(plaintext)?);
+            }
+        }
+        let bundle = {
+            let st = self.state.lock().unwrap();
+            st.bundles.get(&peer).copied()
+        }
+        .ok_or_else(|| anyhow!("no pre-key bundle for peer; handshake incomplete"))?;
+        let (session, ciphertext) = {
+            let acct = self.messaging.lock().unwrap();
+            RatchetSession::initiate(&acct, &bundle, plaintext)?
+        };
+        self.state.lock().unwrap().sessions.insert(peer, session);
+        Ok(ciphertext)
     }
 
     /// Send a frame to a connected peer.
@@ -589,25 +619,36 @@ async fn setup_connection(
     let hello = serde_json::to_vec(&Wire::Hello { bundle: our_bundle })?;
     conn.send_frame(&hello).await?;
 
-    // Receive the peer's Hello (the first frame they send).
-    let first = conn.recv_frame().await?;
+    // Receive the peer's Hello. Each frame rides its own QUIC stream and QUIC
+    // does not order across streams, so an application frame can legally be
+    // accepted before the Hello. Process any such early frames best-effort and
+    // keep waiting for the Hello instead of aborting the whole connection.
     let peer = conn.remote_id_bytes();
-    match serde_json::from_slice::<Wire>(&first)? {
-        Wire::Hello { bundle } => {
-            let mut st = state.lock().unwrap();
-            st.bundles.insert(peer, bundle);
-            // Trust-on-first-use: pin this id the first time we see it.
-            st.pinned.entry(peer).or_insert(peer);
-            st.conns.insert(peer, conn.clone());
-            st.conversations.entry(peer).or_default();
+    let bundle = loop {
+        let frame = conn.recv_frame().await?;
+        match serde_json::from_slice::<Wire>(&frame) {
+            Ok(Wire::Hello { bundle }) => break bundle,
+            Ok(other) => handle_frame(other, peer, &messaging, &state, &events),
+            Err(_) => continue, // skip malformed frames
         }
-        _ => return Err(anyhow!("expected Hello as first frame")),
-    }
+    };
+    let generation = {
+        let mut st = state.lock().unwrap();
+        st.bundles.insert(peer, bundle);
+        // Trust-on-first-use: pin this id the first time we see it.
+        st.pinned.entry(peer).or_insert(peer);
+        st.conns.insert(peer, conn.clone());
+        let generation = st.next_gen;
+        st.next_gen += 1;
+        st.conn_gen.insert(peer, generation);
+        st.conversations.entry(peer).or_default();
+        generation
+    };
     let _ = events.send(EngineEvent::PeerConnected(peer));
 
     // Service the rest of the connection in the background.
     tokio::spawn(async move {
-        reader_loop(conn, peer, messaging, state, events, download_dir).await;
+        reader_loop(conn, peer, generation, messaging, state, events, download_dir).await;
     });
 
     Ok(peer)
@@ -618,6 +659,7 @@ async fn setup_connection(
 async fn reader_loop(
     conn: Conn,
     peer: PeerKey,
+    generation: u64,
     messaging: Arc<Mutex<MessagingAccount>>,
     state: Arc<Mutex<State>>,
     events: mpsc::UnboundedSender<EngineEvent>,
@@ -641,6 +683,22 @@ async fn reader_loop(
             }
             Err(_) => break, // connection closed
         }
+    }
+    // The connection is gone. Evict it so the next send/dial doesn't reuse a
+    // dead `Conn`, but only if it is still the registered one — a newer
+    // reconnection (higher generation) must not be torn down by this old loop.
+    let was_current = {
+        let mut st = state.lock().unwrap();
+        if st.conn_gen.get(&peer).copied() == Some(generation) {
+            st.conns.remove(&peer);
+            st.conn_gen.remove(&peer);
+            true
+        } else {
+            false
+        }
+    };
+    if was_current {
+        let _ = events.send(EngineEvent::PeerDisconnected(peer));
     }
 }
 

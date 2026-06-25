@@ -44,6 +44,10 @@ export default function App() {
   const connectedRef = useRef<Set<string>>(new Set());
   const meRef = useRef<WhoAmI | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  // Throttle outgoing "typing" pings (one QUIC stream each) to ~1/s, and keep a
+  // single pending timeout for clearing the *incoming* typing indicator.
+  const lastTypingRef = useRef(0);
+  const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   selectedRef.current = selected;
   meRef.current = me;
 
@@ -114,12 +118,30 @@ export default function App() {
           break;
         case "peer_connected":
           connectedRef.current.add(p.id);
+          // Add the peer if we hadn't discovered it via mDNS yet — otherwise
+          // someone who dials *us* would never appear in the sidebar.
           setPeers((prev) =>
-            prev.map((x) => (x.id === p.id ? { ...x, connected: true } : x)),
+            prev.some((x) => x.id === p.id)
+              ? prev.map((x) => (x.id === p.id ? { ...x, connected: true } : x))
+              : [...prev, { id: p.id, connected: true }],
+          );
+          break;
+        case "peer_disconnected":
+          connectedRef.current.delete(p.id);
+          setPeers((prev) =>
+            prev.map((x) => (x.id === p.id ? { ...x, connected: false } : x)),
           );
           break;
         case "message":
         case "file_received":
+          // A message proves a live connection from a peer who may not be in
+          // the list yet; surface them so the conversation is reachable.
+          connectedRef.current.add(p.peer);
+          setPeers((prev) =>
+            prev.some((x) => x.id === p.peer)
+              ? prev.map((x) => (x.id === p.peer ? { ...x, connected: true } : x))
+              : [...prev, { id: p.peer, connected: true }],
+          );
           if (sel?.kind === "peer" && sel.id === p.peer) loadHistory(sel);
           break;
         case "group_message":
@@ -131,7 +153,8 @@ export default function App() {
         case "typing":
           if (sel?.kind === "peer" && sel.id === p.peer) {
             setTypingPeer(p.peer);
-            setTimeout(
+            if (typingTimer.current) clearTimeout(typingTimer.current);
+            typingTimer.current = setTimeout(
               () => setTypingPeer((t) => (t === p.peer ? null : t)),
               2500,
             );
@@ -146,6 +169,7 @@ export default function App() {
     return () => {
       unlisten.then((f) => f());
       clearInterval(poll);
+      if (typingTimer.current) clearTimeout(typingTimer.current);
     };
   }, [refreshPeers, refreshGroups, loadHistory]);
 
@@ -360,8 +384,13 @@ export default function App() {
                 placeholder="Type a message…"
                 onChange={(e) => {
                   setDraft(e.target.value);
-                  if (selected.kind === "peer")
-                    invoke("notify_typing", { peer: selected.id }).catch(() => {});
+                  if (selected.kind === "peer") {
+                    const now = Date.now();
+                    if (now - lastTypingRef.current > 1500) {
+                      lastTypingRef.current = now;
+                      invoke("notify_typing", { peer: selected.id }).catch(() => {});
+                    }
+                  }
                 }}
                 onKeyDown={(e) => e.key === "Enter" && sendMessage()}
               />

@@ -25,6 +25,10 @@ COPY . .
 ENV APPIMAGE_EXTRACT_AND_RUN=1
 ENV NO_STRIP=true
 
-# Build the frontend + both Linux bundles (.deb for apt users, .AppImage as the
-# portable single-file build that runs across distros).
-RUN cd app && npm ci && npm run tauri build -- --bundles deb,appimage
+# Build the frontend + the .deb (the binary compiles once here).
+RUN cd app && npm ci && npm run tauri build -- --bundles deb
+
+# Re-bundle the already-built binary as a portable .AppImage. Kept separate and
+# non-fatal so a flaky AppImage toolchain never blocks the .deb.
+RUN cd app && (npm run tauri build -- --bundles appimage \
+      || echo "WARNING: AppImage bundling failed (non-fatal); the .deb is still produced.")

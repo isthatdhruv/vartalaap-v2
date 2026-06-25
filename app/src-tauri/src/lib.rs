@@ -212,6 +212,9 @@ fn emit_event(handle: &tauri::AppHandle, me: &[u8; 32], ev: EngineEvent) {
         EngineEvent::PeerConnected(p) => {
             serde_json::json!({ "kind": "peer_connected", "id": hexkey(&p) })
         }
+        EngineEvent::PeerDisconnected(p) => {
+            serde_json::json!({ "kind": "peer_disconnected", "id": hexkey(&p) })
+        }
         EngineEvent::MessageReceived { peer, message } => serde_json::json!({
             "kind": "message",
             "peer": hexkey(&peer),
