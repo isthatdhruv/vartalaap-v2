@@ -56,6 +56,10 @@ pub enum EngineEvent {
         name: String,
         path: String,
     },
+    /// We were invited to (or learned about) a group.
+    GroupInvited(GroupId),
+    /// A message arrived in a group.
+    GroupMessageReceived { group: GroupId, message: Message },
 }
 
 /// Frames exchanged on the wire (JSON-encoded).
@@ -76,14 +80,31 @@ enum Wire {
     Read { up_to: u64 },
 }
 
+/// A group's stable identifier.
+pub type GroupId = [u8; 16];
+
+/// Metadata describing a group conversation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupInfo {
+    pub id: GroupId,
+    pub name: String,
+    /// All members, including the creator (sorted, deduplicated).
+    pub members: Vec<PeerKey>,
+    pub creator: PeerKey,
+}
+
 /// The plaintext carried inside a ratchet-encrypted [`Wire::Message`].
 #[derive(Serialize, Deserialize)]
 enum Payload {
-    /// A chat message (text or a file reference).
+    /// A 1:1 chat message (text or a file reference).
     Chat(Message),
     /// A file offer: the chat message plus the secret key for the upcoming blob
     /// stream. The key travels end-to-end and never touches the persisted CRDT.
     FileOffer { message: Message, key: [u8; 32] },
+    /// An invitation announcing a group and its membership.
+    GroupInvite(GroupInfo),
+    /// A message addressed to a group (fanned out pairwise to each member).
+    GroupMessage { group: GroupId, message: Message },
 }
 
 /// A file we've been offered and expect a blob stream for.
@@ -106,6 +127,10 @@ struct State {
     discovered: BTreeSet<PeerKey>,
     /// File transfers offered but not yet received, keyed by transfer id.
     pending_files: HashMap<[u8; 16], PendingFile>,
+    /// Groups we belong to, keyed by group id.
+    groups: HashMap<GroupId, GroupInfo>,
+    /// Per-group message history (CRDT), keyed by group id.
+    group_convos: HashMap<GroupId, Conversation>,
 }
 
 /// A running Vartalaap node.
@@ -450,6 +475,103 @@ impl Node {
                 .collect(),
         }
     }
+
+    /// Encrypt a payload for `peer` and send it as a control frame.
+    async fn send_payload(&self, peer: PeerKey, payload: &Payload) -> Result<()> {
+        let ciphertext = self.encrypt_for(peer, &serde_json::to_vec(payload)?)?;
+        let conn = {
+            let st = self.state.lock().unwrap();
+            st.conns.get(&peer).cloned()
+        }
+        .ok_or_else(|| anyhow!("no connection to peer"))?;
+        conn.send_frame(&serde_json::to_vec(&Wire::Message { ciphertext })?)
+            .await?;
+        Ok(())
+    }
+
+    /// Create a group (you are added automatically) and invite each member.
+    /// Members you can currently reach are invited; others heal in on reconnect.
+    pub async fn create_group(&self, name: String, members: Vec<PeerKey>) -> Result<GroupId> {
+        let mut all = members;
+        all.push(self.id);
+        all.sort();
+        all.dedup();
+        let mut id = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+        let info = GroupInfo {
+            id,
+            name,
+            members: all.clone(),
+            creator: self.id,
+        };
+        {
+            let mut st = self.state.lock().unwrap();
+            st.groups.insert(id, info.clone());
+            st.group_convos.entry(id).or_default();
+        }
+        for m in all {
+            if m == self.id {
+                continue;
+            }
+            let _ = self
+                .send_payload(m, &Payload::GroupInvite(info.clone()))
+                .await;
+        }
+        Ok(id)
+    }
+
+    /// Send a text message to every reachable member of a group (pairwise, E2E).
+    pub async fn send_group_text(&self, group: GroupId, body: &str) -> Result<()> {
+        let (members, message) = {
+            let mut st = self.state.lock().unwrap();
+            let info = st
+                .groups
+                .get(&group)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown group"))?;
+            let message =
+                st.group_convos
+                    .entry(group)
+                    .or_default()
+                    .create_text(self.id, now_millis(), body);
+            (info.members, message)
+        };
+        for m in members {
+            if m == self.id {
+                continue;
+            }
+            let _ = self
+                .send_payload(
+                    m,
+                    &Payload::GroupMessage {
+                        group,
+                        message: message.clone(),
+                    },
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Groups this node belongs to.
+    pub fn groups(&self) -> Vec<GroupInfo> {
+        self.state
+            .lock()
+            .unwrap()
+            .groups
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Ordered messages in a group's conversation.
+    pub fn group_conversation(&self, group: &GroupId) -> Vec<Message> {
+        let st = self.state.lock().unwrap();
+        match st.group_convos.get(group) {
+            None => Vec::new(),
+            Some(conv) => conv.messages_ordered().into_iter().cloned().collect(),
+        }
+    }
 }
 
 /// Perform the Hello handshake on a freshly-opened connection, then spawn a
@@ -535,31 +657,43 @@ fn handle_frame(
             state.lock().unwrap().bundles.insert(peer, bundle);
         }
         Wire::Message { ciphertext } => {
-            if let Ok(payload) = decrypt_payload(peer, &ciphertext, messaging, state) {
-                let message = match payload {
-                    Payload::Chat(message) => message,
-                    Payload::FileOffer { message, key } => {
-                        if let MessageKind::File(ref f) = message.kind {
-                            state.lock().unwrap().pending_files.insert(
-                                f.transfer_id,
-                                PendingFile {
-                                    key,
-                                    sha256: f.sha256,
-                                    name: f.name.clone(),
-                                },
-                            );
-                        }
-                        message
+            let Ok(payload) = decrypt_payload(peer, &ciphertext, messaging, state) else {
+                return;
+            };
+            match payload {
+                Payload::Chat(message) => apply_direct_message(peer, message, state, events),
+                Payload::FileOffer { message, key } => {
+                    if let MessageKind::File(ref f) = message.kind {
+                        state.lock().unwrap().pending_files.insert(
+                            f.transfer_id,
+                            PendingFile {
+                                key,
+                                sha256: f.sha256,
+                                name: f.name.clone(),
+                            },
+                        );
                     }
-                };
-                state
-                    .lock()
-                    .unwrap()
-                    .conversations
-                    .entry(peer)
-                    .or_default()
-                    .apply(message.clone());
-                let _ = events.send(EngineEvent::MessageReceived { peer, message });
+                    apply_direct_message(peer, message, state, events);
+                }
+                Payload::GroupInvite(info) => {
+                    let id = info.id;
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.groups.entry(id).or_insert(info);
+                        st.group_convos.entry(id).or_default();
+                    }
+                    let _ = events.send(EngineEvent::GroupInvited(id));
+                }
+                Payload::GroupMessage { group, message } => {
+                    state
+                        .lock()
+                        .unwrap()
+                        .group_convos
+                        .entry(group)
+                        .or_default()
+                        .apply(message.clone());
+                    let _ = events.send(EngineEvent::GroupMessageReceived { group, message });
+                }
             }
         }
         Wire::Typing => {
@@ -579,6 +713,23 @@ fn handle_frame(
             let _ = events.send(EngineEvent::ReadReceipt { peer, up_to });
         }
     }
+}
+
+/// Apply a 1:1 message to the per-peer conversation and notify listeners.
+fn apply_direct_message(
+    peer: PeerKey,
+    message: Message,
+    state: &Arc<Mutex<State>>,
+    events: &mpsc::UnboundedSender<EngineEvent>,
+) {
+    state
+        .lock()
+        .unwrap()
+        .conversations
+        .entry(peer)
+        .or_default()
+        .apply(message.clone());
+    let _ = events.send(EngineEvent::MessageReceived { peer, message });
 }
 
 /// Receive a blob stream: wait for the matching offer, decrypt each chunk to a
@@ -833,6 +984,78 @@ mod tests {
 
         std::fs::remove_file(&src).ok();
         std::fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    async fn wait_for_group(
+        rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
+        gid: GroupId,
+    ) -> Message {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Some(EngineEvent::GroupMessageReceived { group, message }) if group == gid => {
+                        return message
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for a group message")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn three_nodes_group_chat() -> Result<()> {
+        let (alice, mut alice_rx) = Node::start([31u8; 32]).await?;
+        let (bob, mut bob_rx) = Node::start([32u8; 32]).await?;
+        let (carol, mut carol_rx) = Node::start([33u8; 32]).await?;
+        let (aid, bid, cid) = (alice.id(), bob.id(), carol.id());
+
+        // Establish the full mesh (every pair connected).
+        let secs = Duration::from_secs(20);
+        timeout(secs, alice.connect(bid))
+            .await
+            .map_err(|_| anyhow!("a-b timeout"))??;
+        timeout(secs, alice.connect(cid))
+            .await
+            .map_err(|_| anyhow!("a-c timeout"))??;
+        timeout(secs, bob.connect(cid))
+            .await
+            .map_err(|_| anyhow!("b-c timeout"))??;
+
+        // Alice creates a group; Bob and Carol receive invites.
+        let gid = alice.create_group("study".into(), vec![bid, cid]).await?;
+        wait_for(
+            &mut bob_rx,
+            |e| matches!(e, EngineEvent::GroupInvited(g) if *g == gid),
+        )
+        .await;
+        wait_for(
+            &mut carol_rx,
+            |e| matches!(e, EngineEvent::GroupInvited(g) if *g == gid),
+        )
+        .await;
+
+        // Alice → group reaches both.
+        alice.send_group_text(gid, "hello team").await?;
+        assert_eq!(wait_for_group(&mut bob_rx, gid).await.body, "hello team");
+        assert_eq!(wait_for_group(&mut carol_rx, gid).await.body, "hello team");
+
+        // Bob → group reaches Alice and Carol (not just the creator).
+        bob.send_group_text(gid, "hi from bob").await?;
+        let from_bob_a = wait_for_group(&mut alice_rx, gid).await;
+        let from_bob_c = wait_for_group(&mut carol_rx, gid).await;
+        assert_eq!(from_bob_a.body, "hi from bob");
+        assert_eq!(from_bob_a.author, bid);
+        assert_eq!(from_bob_c.body, "hi from bob");
+
+        // All three converge on the same two messages.
+        assert_eq!(alice.group_conversation(&gid).len(), 2);
+        assert_eq!(bob.group_conversation(&gid).len(), 2);
+        assert_eq!(carol.group_conversation(&gid).len(), 2);
+        let _ = aid;
         Ok(())
     }
 }
