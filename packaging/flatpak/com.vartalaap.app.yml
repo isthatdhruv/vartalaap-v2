@@ -34,7 +34,10 @@ modules:
       - install -Dm755 usr/bin/vartalaap-app /app/bin/vartalaap-app
       - install -Dm644 usr/share/applications/Vartalaap.desktop
         /app/share/applications/com.vartalaap.app.desktop
+      # AppStream requires a valid freedesktop category; the Tauri-generated
+      # .desktop has none, which fails `appstreamcli compose`.
       - desktop-file-edit --set-icon=com.vartalaap.app
+        --add-category=Network --add-category=InstantMessaging
         /app/share/applications/com.vartalaap.app.desktop
       - install -Dm644 usr/share/icons/hicolor/128x128/apps/vartalaap-app.png
         /app/share/icons/hicolor/128x128/apps/com.vartalaap.app.png
