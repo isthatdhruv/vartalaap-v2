@@ -47,8 +47,12 @@ rm -rf "$FP/build" "$FP/repo"
 flatpak-builder --user --force-clean --repo="$FP/repo" "$FP/build" \
   "$FP/com.vartalaap.app.yml"
 mkdir -p packaging/out
-flatpak build-bundle "$FP/repo" packaging/out/Vartalaap.flatpak com.vartalaap.app
+# --runtime-repo embeds Flathub into the bundle so `flatpak install` can pull the
+# org.gnome.Platform runtime automatically (a .flatpak ships the app, not the runtime).
+flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+  "$FP/repo" packaging/out/Vartalaap.flatpak com.vartalaap.app
 
 echo ""
 echo ">> Done: packaging/out/Vartalaap.flatpak"
-echo "   Install on ANY Linux:  flatpak install --user ./packaging/out/Vartalaap.flatpak"
+echo "   Install on ANY Linux (needs internet once for the GNOME runtime):"
+echo "     flatpak install --user ./packaging/out/Vartalaap.flatpak"
