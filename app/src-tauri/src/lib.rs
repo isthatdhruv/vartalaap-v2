@@ -49,6 +49,9 @@ struct FileDto {
     name: String,
     size: u64,
     mime: String,
+    transfer_id: String,
+    /// Local path if this file has been received & saved (receiver side only).
+    received_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -69,13 +72,24 @@ struct GroupDto {
     creator: String,
 }
 
-fn message_dto(m: Message, me: &[u8; 32]) -> MessageDto {
+fn message_dto(m: Message, me: &[u8; 32], node: &Node) -> MessageDto {
     let file = match &m.kind {
-        MessageKind::File(f) => Some(FileDto {
-            name: f.name.clone(),
-            size: f.size,
-            mime: f.mime.clone(),
-        }),
+        MessageKind::File(f) => {
+            // Only the receiver looks up a downloaded copy; the sender already
+            // has the original file.
+            let received_path = if m.author != *me {
+                node.received_file_path(f.transfer_id, &f.name)
+            } else {
+                None
+            };
+            Some(FileDto {
+                name: f.name.clone(),
+                size: f.size,
+                mime: f.mime.clone(),
+                transfer_id: hex::encode(f.transfer_id),
+                received_path,
+            })
+        }
         MessageKind::Text => None,
     };
     MessageDto {
@@ -118,7 +132,7 @@ fn history(peer: String, state: State<'_, NodeState>) -> Result<Vec<MessageDto>,
     Ok(state
         .conversation(&key)
         .into_iter()
-        .map(|m| message_dto(m, &me))
+        .map(|m| message_dto(m, &me, state.inner()))
         .collect())
 }
 
@@ -150,6 +164,23 @@ async fn notify_typing(peer: String, state: State<'_, NodeState>) -> Result<(), 
     let key = parse_key(&peer)?;
     let node = state.inner().clone();
     node.notify_typing(key).await.map_err(|e| e.to_string())
+}
+
+/// Copy a received file from its auto-saved location to a user-chosen path.
+#[tauri::command]
+fn save_file_as(src: String, dest: String) -> Result<(), String> {
+    std::fs::copy(&src, &dest)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Open a path with the system default application.
+#[tauri::command]
+fn open_path(path: String, app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -188,7 +219,7 @@ fn group_history(group: String, state: State<'_, NodeState>) -> Result<Vec<Messa
     Ok(state
         .group_conversation(&g)
         .into_iter()
-        .map(|m| message_dto(m, &me))
+        .map(|m| message_dto(m, &me, state.inner()))
         .collect())
 }
 
@@ -243,6 +274,18 @@ fn emit_event(handle: &tauri::AppHandle, me: &[u8; 32], ev: EngineEvent) {
             "name": name,
             "path": path,
         }),
+        EngineEvent::FileFailed {
+            peer,
+            transfer_id,
+            name,
+            reason,
+        } => serde_json::json!({
+            "kind": "file_failed",
+            "peer": hexkey(&peer),
+            "transfer_id": hex::encode(transfer_id),
+            "name": name,
+            "reason": reason,
+        }),
         EngineEvent::GroupInvited(g) => {
             serde_json::json!({ "kind": "group_invited", "group": hexgroup(&g) })
         }
@@ -295,6 +338,8 @@ pub fn run() {
             connect,
             send,
             send_file,
+            save_file_as,
+            open_path,
             notify_typing,
             list_groups,
             create_group,
