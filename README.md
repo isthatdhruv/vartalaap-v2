@@ -95,15 +95,19 @@ Vartalaap is a small **Rust engine** (fully usable and tested headless) wrapped 
 Grab an installer from the [**Releases**](https://github.com/isthatdhruv/vartalaap-v2/releases)
 page (produced by CI for every platform), or build from source below.
 
-| OS | File | Install |
+| Your system | File | Install |
 |---|---|---|
-| Linux (any distro) | `.AppImage` | `chmod +x *.AppImage && ./*.AppImage` |
-| Ubuntu / Debian | `.deb` | `sudo apt install ./Vartalaap_*.deb` |
+| **Linux, 2022+** (Ubuntu 22.04+, Debian 12+, Fedora 36+) | `.AppImage` (portable, bundles webkit) | `chmod +x *.AppImage && ./*.AppImage` |
+| Ubuntu / Debian (prefer apt) | `.deb` | `sudo apt install ./Vartalaap_*.deb` |
+| **Older Linux** (Ubuntu 18.04 / 20.04, Debian 11) | **`.flatpak`** | `flatpak install --user ./Vartalaap.flatpak && flatpak run com.vartalaap.app` |
 | Windows 10/11 | `.exe` | run the installer (WebView2 is bootstrapped automatically) |
 | macOS | `.dmg` | open and drag to Applications |
 
-> Linux requires `webkit2gtk-4.1` (Ubuntu 22.04+ / Debian 12+ / Fedora 36+). The
-> `.AppImage` is the most portable single-file option.
+> **Linux support floor.** Tauri 2 requires `webkit2gtk-4.1`, which only ships on
+> ~2022+ distros — so the `.deb`/`.AppImage` need **Ubuntu 22.04+ / Debian 12+ /
+> Fedora 36+**. On **older Linux** (Ubuntu 18.04/20.04, Debian 11) use the
+> **`.flatpak`**: it bundles its own webkit + userspace inside a sandbox and runs
+> on anything with Flatpak installed, regardless of the host's age.
 
 ## Build from source
 
@@ -123,11 +127,18 @@ cd app && npm install && npm run tauri dev
 One bash script per target (see [`scripts/`](scripts/)):
 
 ```bash
-./scripts/build-linux-appimage.sh   # portable .AppImage   (any Linux, via Docker)
-./scripts/build-linux-deb.sh        # .deb                  (any Linux, via Docker)
-./scripts/build-macos.sh            # universal .dmg        (run on macOS)
-./scripts/build-windows.sh          # .exe installer        (run on Windows, Git Bash)
+./scripts/build-linux-appimage.sh   # portable .AppImage  (Linux 2022+, via Docker)
+./scripts/build-linux-deb.sh        # .deb                (Linux 2022+, via Docker)
+./scripts/build-linux-flatpak.sh    # .flatpak            (runs on OLD Linux too)
+./scripts/build-macos.sh            # universal .dmg       (run on macOS)
+./scripts/build-windows.sh          # .exe installer       (run on Windows, Git Bash)
 ```
+
+> ⚠️ **Build Linux packages with these scripts, not a bare `tauri build`.** The
+> Linux scripts compile inside an **Ubuntu 22.04 container** (glibc 2.35). A
+> native build on a newer distro (e.g. 24.04/26.04) bakes in a higher glibc
+> floor and **won't start on 22.04** — which is the usual "it installed but
+> won't open" cause.
 
 Or let CI build **all of them** at once: push a `v*` tag (or use **Actions → Release →
 Run workflow**) and download the artifacts. See

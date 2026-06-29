@@ -20,3 +20,9 @@ src-tauri/gen
 
 # Built installers
 packaging/out/
+
+# Flatpak build artifacts
+packaging/flatpak/vartalaap.deb
+packaging/flatpak/build/
+packaging/flatpak/repo/
+packaging/flatpak/.flatpak-builder/
