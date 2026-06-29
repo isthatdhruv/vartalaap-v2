@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.vartalaap.app</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Vartalaap</name>
+  <summary>Serverless, end-to-end-encrypted peer-to-peer LAN chat</summary>
+  <description>
+    <p>
+      Vartalaap is a serverless, end-to-end-encrypted chat app for the local
+      network. Peers discover each other automatically over the LAN and talk
+      directly, with every message and file end-to-end encrypted. No servers,
+      no accounts, no cloud.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.vartalaap.app.desktop</launchable>
+  <url type="homepage">https://github.com/isthatdhruv/vartalaap-v2</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-06-29"/>
+  </releases>
+</component>

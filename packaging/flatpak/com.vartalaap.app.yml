@@ -1,0 +1,44 @@
+# Flatpak packaging — the ONLY way to run Vartalaap on pre-2022 Linux
+# (Ubuntu 18.04 / 20.04, Debian 11, etc.). The org.gnome.Platform runtime
+# supplies webkit2gtk-4.1 and a modern userspace *inside the sandbox*, so the
+# host's ancient webkit/glibc no longer matter.
+#
+# It wraps the .deb built on Ubuntu 22.04 (see scripts/build-linux-flatpak.sh),
+# rather than compiling Rust inside flatpak-builder.
+id: com.vartalaap.app
+runtime: org.gnome.Platform
+runtime-version: "47"
+sdk: org.gnome.Sdk
+command: vartalaap-app
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Peer-to-peer over the LAN (QUIC + mDNS) needs host network access.
+  - --share=network
+
+modules:
+  - name: vartalaap
+    buildsystem: simple
+    sources:
+      # Produced by scripts/build-linux-flatpak.sh (copied here as a fixed name).
+      - type: file
+        path: vartalaap.deb
+      - type: file
+        path: com.vartalaap.app.metainfo.xml
+    build-commands:
+      - ar -x vartalaap.deb
+      - tar -xf data.tar.gz
+      - install -Dm755 usr/bin/vartalaap-app /app/bin/vartalaap-app
+      - install -Dm644 usr/share/applications/Vartalaap.desktop
+        /app/share/applications/com.vartalaap.app.desktop
+      - desktop-file-edit --set-icon=com.vartalaap.app
+        /app/share/applications/com.vartalaap.app.desktop
+      - install -Dm644 usr/share/icons/hicolor/128x128/apps/vartalaap-app.png
+        /app/share/icons/hicolor/128x128/apps/com.vartalaap.app.png
+      - install -Dm644 usr/share/icons/hicolor/32x32/apps/vartalaap-app.png
+        /app/share/icons/hicolor/32x32/apps/com.vartalaap.app.png
+      - install -Dm644 com.vartalaap.app.metainfo.xml
+        /app/share/metainfo/com.vartalaap.app.metainfo.xml
