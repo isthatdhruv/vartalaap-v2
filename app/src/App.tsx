@@ -1,13 +1,19 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 type WhoAmI = { id: string; fingerprint: string; display_name: string };
 type Peer = { id: string; connected: boolean };
 type Group = { id: string; name: string; members: string[]; creator: string };
-type FileInfo = { name: string; size: number; mime: string };
+type FileInfo = {
+  name: string;
+  size: number;
+  mime: string;
+  transfer_id: string;
+  received_path: string | null;
+};
 type Message = {
   id: string;
   author: string;
@@ -39,6 +45,8 @@ export default function App() {
   const [showNewGroup, setShowNewGroup] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [groupPicks, setGroupPicks] = useState<Set<string>>(new Set());
+  // transfer_id -> failure reason, for received files that didn't complete.
+  const [fileErrors, setFileErrors] = useState<Record<string, string>>({});
 
   const selectedRef = useRef<Target | null>(null);
   const connectedRef = useRef<Set<string>>(new Set());
@@ -144,6 +152,9 @@ export default function App() {
           );
           if (sel?.kind === "peer" && sel.id === p.peer) loadHistory(sel);
           break;
+        case "file_failed":
+          setFileErrors((prev) => ({ ...prev, [p.transfer_id]: p.reason }));
+          break;
         case "group_message":
           if (sel?.kind === "group" && sel.id === p.group) loadHistory(sel);
           break;
@@ -215,6 +226,28 @@ export default function App() {
       loadHistory(selected);
     } catch (e) {
       console.error("send_file failed", e);
+    }
+  };
+
+  // Receiver: copy a downloaded file to a location of the user's choosing.
+  const saveFileAs = async (file: FileInfo) => {
+    if (!file.received_path) return;
+    const dest = await save({ defaultPath: file.name });
+    if (typeof dest !== "string") return;
+    try {
+      await invoke("save_file_as", { src: file.received_path, dest });
+    } catch (e) {
+      console.error("save_file_as failed", e);
+    }
+  };
+
+  // Receiver: open the downloaded file with the system default app.
+  const openFile = async (file: FileInfo) => {
+    if (!file.received_path) return;
+    try {
+      await invoke("open_path", { path: file.received_path });
+    } catch (e) {
+      console.error("open failed", e);
     }
   };
 
@@ -359,10 +392,27 @@ export default function App() {
                   className={`bubble ${m.mine ? "mine" : "theirs"}`}
                 >
                   {m.file ? (
-                    <span className="file-chip">
-                      📎 {m.file.name}
-                      <span className="file-size">{fmtSize(m.file.size)}</span>
-                    </span>
+                    <div className="file-msg">
+                      <span className="file-chip">
+                        📎 {m.file.name}
+                        <span className="file-size">{fmtSize(m.file.size)}</span>
+                      </span>
+                      {!m.mine &&
+                        (fileErrors[m.file.transfer_id] ? (
+                          <span className="file-error">
+                            ⚠ {fileErrors[m.file.transfer_id]}
+                          </span>
+                        ) : m.file.received_path ? (
+                          <span className="file-actions">
+                            <button onClick={() => saveFileAs(m.file!)}>
+                              Save as…
+                            </button>
+                            <button onClick={() => openFile(m.file!)}>Open</button>
+                          </span>
+                        ) : (
+                          <span className="file-receiving">receiving…</span>
+                        ))}
+                    </div>
                   ) : (
                     m.body
                   )}

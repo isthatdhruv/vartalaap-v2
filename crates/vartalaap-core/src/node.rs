@@ -59,6 +59,14 @@ pub enum EngineEvent {
         name: String,
         path: String,
     },
+    /// A file transfer was offered but did not complete (timed out, decrypt
+    /// failure, or hash mismatch). Surfaced so the receiver isn't left guessing.
+    FileFailed {
+        peer: PeerKey,
+        transfer_id: [u8; 16],
+        name: String,
+        reason: String,
+    },
     /// We were invited to (or learned about) a group.
     GroupInvited(GroupId),
     /// A message arrived in a group.
@@ -602,6 +610,14 @@ impl Node {
             Some(conv) => conv.messages_ordered().into_iter().cloned().collect(),
         }
     }
+
+    /// The on-disk path of a received file if it has finished downloading, else
+    /// `None`. Derived from the deterministic download location, so it works
+    /// even across restarts (no in-memory bookkeeping required).
+    pub fn received_file_path(&self, transfer_id: [u8; 16], name: &str) -> Option<String> {
+        let path = blob_dest(&self.download_dir, &transfer_id, name);
+        path.exists().then(|| path.to_string_lossy().into_owned())
+    }
 }
 
 /// Perform the Hello handshake on a freshly-opened connection, then spawn a
@@ -648,7 +664,16 @@ async fn setup_connection(
 
     // Service the rest of the connection in the background.
     tokio::spawn(async move {
-        reader_loop(conn, peer, generation, messaging, state, events, download_dir).await;
+        reader_loop(
+            conn,
+            peer,
+            generation,
+            messaging,
+            state,
+            events,
+            download_dir,
+        )
+        .await;
     });
 
     Ok(peer)
@@ -803,36 +828,75 @@ async fn handle_blob(
     // The offer frame may be processed after this stream is accepted (QUIC does
     // not order across streams), so wait briefly for it to register.
     let Some((key, sha256, name)) = wait_for_offer(&state, transfer_id).await else {
+        // No offer arrived, so we have no key/name to even describe it.
         return;
     };
-    let dest = download_dir.join(format!(
-        "{:02x}{:02x}-{}",
-        transfer_id[0], transfer_id[1], name
-    ));
+    let dest = blob_dest(&download_dir, &transfer_id, &name);
     let mut sink = match DecryptSink::create(&dest, key) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            let _ = events.send(EngineEvent::FileFailed {
+                peer,
+                transfer_id,
+                name,
+                reason: format!("cannot create download file: {e}"),
+            });
+            return;
+        }
     };
     loop {
         match blob.next_chunk().await {
             Ok(Some(chunk)) => {
                 if sink.write_chunk(&chunk).is_err() {
-                    return; // tampered chunk
+                    let _ = events.send(EngineEvent::FileFailed {
+                        peer,
+                        transfer_id,
+                        name,
+                        reason: "decryption failed (corrupt or tampered data)".into(),
+                    });
+                    return;
                 }
             }
             Ok(None) => break,
-            Err(_) => return,
+            Err(_) => {
+                let _ = events.send(EngineEvent::FileFailed {
+                    peer,
+                    transfer_id,
+                    name,
+                    reason: "connection interrupted mid-transfer".into(),
+                });
+                return;
+            }
         }
     }
-    if let Ok(path) = sink.finish(sha256) {
-        state.lock().unwrap().pending_files.remove(&transfer_id);
-        let _ = events.send(EngineEvent::FileReceived {
-            peer,
-            transfer_id,
-            name,
-            path: path.to_string_lossy().into_owned(),
-        });
+    match sink.finish(sha256) {
+        Ok(path) => {
+            state.lock().unwrap().pending_files.remove(&transfer_id);
+            let _ = events.send(EngineEvent::FileReceived {
+                peer,
+                transfer_id,
+                name,
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        Err(_) => {
+            let _ = events.send(EngineEvent::FileFailed {
+                peer,
+                transfer_id,
+                name,
+                reason: "integrity check failed (hash mismatch)".into(),
+            });
+        }
     }
+}
+
+/// Deterministic on-disk location for a received blob — used both when writing
+/// it and when later looking it up, so the two never drift.
+fn blob_dest(download_dir: &Path, transfer_id: &[u8; 16], name: &str) -> PathBuf {
+    download_dir.join(format!(
+        "{:02x}{:02x}-{}",
+        transfer_id[0], transfer_id[1], name
+    ))
 }
 
 /// Poll for a pending file offer to appear, up to ~2 seconds.
@@ -996,11 +1060,21 @@ mod tests {
         Ok(())
     }
 
-    async fn wait_for_file(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> String {
+    async fn wait_for_file(
+        rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
+    ) -> ([u8; 16], String, String) {
         timeout(Duration::from_secs(30), async {
             loop {
                 match rx.recv().await {
-                    Some(EngineEvent::FileReceived { path, .. }) => return path,
+                    Some(EngineEvent::FileReceived {
+                        transfer_id,
+                        name,
+                        path,
+                        ..
+                    }) => return (transfer_id, name, path),
+                    Some(EngineEvent::FileFailed { reason, .. }) => {
+                        panic!("file transfer failed: {reason}")
+                    }
                     Some(_) => continue,
                     None => panic!("event channel closed"),
                 }
@@ -1032,9 +1106,17 @@ mod tests {
 
         alice.send_file(bob_id, &src).await?;
 
-        let path = wait_for_file(&mut bob_rx).await;
+        let (transfer_id, name, path) = wait_for_file(&mut bob_rx).await;
         let received = std::fs::read(&path)?;
         assert_eq!(received, data, "received file must match the original");
+
+        // The GUI surfaces the download via `received_file_path`; it must resolve
+        // to the same on-disk file.
+        assert_eq!(
+            bob.received_file_path(transfer_id, &name).as_deref(),
+            Some(path.as_str()),
+            "received_file_path must locate the downloaded file"
+        );
 
         // The file also appears in Bob's conversation as a File message.
         let convo = bob.conversation(&alice.id());

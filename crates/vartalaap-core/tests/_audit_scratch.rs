@@ -26,7 +26,10 @@ fn profile_with_avatar_roundtrips() {
     // Reopen a fresh Engine -> forces load + verify path.
     drop(e);
     let e2 = Engine::open(&dir, "pw").unwrap();
-    let got = e2.profile().expect("profile() must not error").expect("present");
+    let got = e2
+        .profile()
+        .expect("profile() must not error")
+        .expect("present");
     assert_eq!(got.avatar.as_deref(), Some(avatar.as_slice()));
     std::fs::remove_dir_all(&dir).ok();
 }

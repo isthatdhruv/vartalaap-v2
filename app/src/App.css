@@ -358,3 +358,36 @@ button:hover {
   font-size: 11px;
   opacity: 0.75;
 }
+
+.file-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.file-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.file-actions button {
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.bubble.theirs .file-actions button {
+  background: var(--accent);
+}
+
+.file-receiving {
+  font-size: 11px;
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.file-error {
+  font-size: 11px;
+  color: #ff7b72;
+}
