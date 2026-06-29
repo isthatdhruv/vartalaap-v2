@@ -120,7 +120,8 @@ jobs:
         run: |
           flatpak-builder --user --force-clean --repo=fp-repo fp-build \
             packaging/flatpak/com.vartalaap.app.yml
-          flatpak build-bundle fp-repo Vartalaap.flatpak com.vartalaap.app
+          flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+            fp-repo Vartalaap.flatpak com.vartalaap.app
 
       - name: Upload Flatpak artifact
         uses: actions/upload-artifact@v4

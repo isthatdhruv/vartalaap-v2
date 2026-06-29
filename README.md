@@ -106,8 +106,10 @@ page (produced by CI for every platform), or build from source below.
 > **Linux support floor.** Tauri 2 requires `webkit2gtk-4.1`, which only ships on
 > ~2022+ distros — so the `.deb`/`.AppImage` need **Ubuntu 22.04+ / Debian 12+ /
 > Fedora 36+**. On **older Linux** (Ubuntu 18.04/20.04, Debian 11) use the
-> **`.flatpak`**: it bundles its own webkit + userspace inside a sandbox and runs
-> on anything with Flatpak installed, regardless of the host's age.
+> **`.flatpak`**: it runs on anything with Flatpak installed, regardless of the
+> host's age. The first install pulls the GNOME runtime from Flathub (needs
+> internet once); if it reports a missing `org.gnome.Platform`, run:
+> `flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo`
 
 ## Build from source
 
