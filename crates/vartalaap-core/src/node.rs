@@ -136,6 +136,12 @@ struct State {
     /// the durable record; this is only "does the UI still owe a Queued
     /// badge," so it does not need to survive a restart.
     queued: HashMap<PeerKey, BTreeSet<vartalaap_sync::MessageId>>,
+    /// Vault load-quarantine warnings recorded at startup, before anything
+    /// had subscribed to the event channel (those events are sent too, but
+    /// go nowhere for a subscriber that attaches after `start_persistent`
+    /// returns). Retained here so a late subscriber — the UI, on mount —
+    /// can still learn about them via [`Node::startup_warnings`].
+    startup_warnings: Vec<String>,
 }
 
 /// Shared connection-handling context: every free function that services a
@@ -231,6 +237,9 @@ impl Node {
                     .group_convos
                     .insert(gid, Conversation::from_snapshot(snap));
             }
+            // Retain a copy in state (for a late subscriber) as well as
+            // sending the events (for a subscriber already listening).
+            initial.startup_warnings = warn_all.clone();
             for detail in warn_all {
                 let _ = tx.send(EngineEvent::StorageWarning { detail });
             }
@@ -374,6 +383,15 @@ impl Node {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Vault-quarantine warnings recorded while loading persisted state at
+    /// startup. The same warnings are also emitted as `StorageWarning`
+    /// events at the time they occur, but that's before the app has had a
+    /// chance to subscribe — this lets a caller that subscribes only after
+    /// `start_persistent` returns (e.g. the UI, on mount) still see them.
+    pub fn startup_warnings(&self) -> Vec<String> {
+        self.ctx.state.lock().unwrap().startup_warnings.clone()
     }
 
     /// A snapshot of the full ordered messages in the conversation with `peer`.
@@ -2495,6 +2513,51 @@ mod tests {
         let contacts = alice.contacts();
         assert_eq!(contacts.len(), 1, "re-handshake must recreate the contact");
         assert_eq!(contacts[0].peer, bob_id);
+        Ok(())
+    }
+
+    /// A convo blob that fails to decrypt at load time (wrong-key/corrupt —
+    /// same technique as
+    /// `persist::tests::corrupt_msg_account_is_quarantined_and_regenerated`)
+    /// is quarantined and warned about, and that warning must survive in
+    /// `startup_warnings()` — not just fire-and-vanish on the event channel,
+    /// which at load time has no subscriber yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn corrupted_convo_surfaces_in_startup_warnings() -> Result<()> {
+        let dir = tmp_data_dir("startup-warn");
+        let peer: PeerKey = [201u8; 32];
+        {
+            let (alice, _rx) = Node::start_persistent(&dir, "pw").await?;
+            {
+                let mut st = alice.ctx.state.lock().unwrap();
+                st.conversations.entry(peer).or_default().create_text(
+                    alice.id(),
+                    now_millis(),
+                    "hi",
+                );
+            }
+            persist_convo(&alice.ctx, &peer);
+            alice.shutdown().await;
+        }
+
+        // Reseal the persisted convo entry under a different vault key, so
+        // the real engine's decrypt fails on reopen.
+        {
+            let other = vartalaap_store::Store::open(
+                &dir.join("vault.redb"),
+                vartalaap_crypto::VaultKey::from([77u8; 32]),
+            )?;
+            other.put_secret(&format!("convo/{}", hex::encode(peer)), b"junk")?;
+        }
+
+        let (alice2, _rx2) = Node::start_persistent(&dir, "pw").await?;
+        assert_eq!(
+            alice2.startup_warnings().len(),
+            1,
+            "one corrupted convo blob must surface as exactly one startup warning"
+        );
+        alice2.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

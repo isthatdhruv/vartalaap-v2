@@ -118,6 +118,12 @@ export default function App() {
     });
     refreshRoster();
     refreshGroups();
+    // Vault-quarantine warnings from loading persisted state at startup are
+    // emitted on the event channel too, but before this effect subscribes —
+    // pull them explicitly so they aren't silently lost.
+    invoke<string[]>("startup_warnings")
+      .then((warnings) => warnings.forEach((text) => pushBanner({ kind: "warn", text })))
+      .catch(() => {});
 
     const unlisten = listen<any>("engine://event", (e) => {
       const p = e.payload;
