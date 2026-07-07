@@ -161,6 +161,14 @@ impl IrohTransport {
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
+
+    /// A future that resolves once this endpoint has been closed (via
+    /// [`Self::close`]). Owned — it does not borrow `self` — so callers can
+    /// race it against other work (e.g. a discovery loop) in a `select!`
+    /// without holding this transport alive for the wait.
+    pub fn closed(&self) -> impl std::future::Future<Output = ()> + 'static {
+        self.endpoint.closed()
+    }
 }
 
 /// Construct a [`PeerId`] from its raw 32 bytes (e.g. a stored Vartalaap ID).
