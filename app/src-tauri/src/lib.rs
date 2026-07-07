@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
-use vartalaap_core::node::{EngineEvent, Node};
+use vartalaap_core::node::{DeliveryStatus, EngineEvent, Node, SyncScope};
 use vartalaap_core::{Message, MessageKind};
 
 type NodeState = Arc<Node>;
@@ -62,6 +62,7 @@ struct MessageDto {
     sent_at: u64,
     mine: bool,
     file: Option<FileDto>,
+    status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -72,7 +73,36 @@ struct GroupDto {
     creator: String,
 }
 
-fn message_dto(m: Message, me: &[u8; 32], node: &Node) -> MessageDto {
+#[derive(Serialize)]
+struct ContactDto {
+    id: String,
+    name: String,
+    online: bool,
+    last_seen: u64,
+    unread: usize,
+    pin_pending: bool,
+}
+
+#[derive(Serialize)]
+struct NearbyDto {
+    id: String,
+}
+
+/// Lowercase wire representation of a [`DeliveryStatus`].
+fn status_str(s: DeliveryStatus) -> &'static str {
+    match s {
+        DeliveryStatus::Queued => "queued",
+        DeliveryStatus::Sent => "sent",
+        DeliveryStatus::Delivered => "delivered",
+    }
+}
+
+fn message_dto(
+    m: Message,
+    me: &[u8; 32],
+    status: Option<DeliveryStatus>,
+    node: &Node,
+) -> MessageDto {
     let file = match &m.kind {
         MessageKind::File(f) => {
             // Only the receiver looks up a downloaded copy; the sender already
@@ -99,6 +129,7 @@ fn message_dto(m: Message, me: &[u8; 32], node: &Node) -> MessageDto {
         body: m.body,
         sent_at: m.sent_at,
         file,
+        status: status.map(status_str).map(str::to_string),
     }
 }
 
@@ -130,9 +161,9 @@ fn history(peer: String, state: State<'_, NodeState>) -> Result<Vec<MessageDto>,
     let key = parse_key(&peer)?;
     let me = state.id();
     Ok(state
-        .conversation(&key)
+        .conversation_with_status(&key)
         .into_iter()
-        .map(|m| message_dto(m, &me, state.inner()))
+        .map(|(m, status)| message_dto(m, &me, status, state.inner()))
         .collect())
 }
 
@@ -144,10 +175,19 @@ async fn connect(id: String, state: State<'_, NodeState>) -> Result<(), String> 
 }
 
 #[tauri::command]
-async fn send(peer: String, body: String, state: State<'_, NodeState>) -> Result<(), String> {
+async fn send(
+    peer: String,
+    body: String,
+    state: State<'_, NodeState>,
+) -> Result<MessageDto, String> {
     let key = parse_key(&peer)?;
     let node = state.inner().clone();
-    node.send_text(key, &body).await.map_err(|e| e.to_string())
+    let me = node.id();
+    let (message, status) = node
+        .send_text(key, &body)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(message_dto(message, &me, Some(status), &node))
 }
 
 #[tauri::command]
@@ -219,7 +259,7 @@ fn group_history(group: String, state: State<'_, NodeState>) -> Result<Vec<Messa
     Ok(state
         .group_conversation(&g)
         .into_iter()
-        .map(|m| message_dto(m, &me, state.inner()))
+        .map(|m| message_dto(m, &me, None, state.inner()))
         .collect())
 }
 
@@ -231,7 +271,91 @@ async fn send_group(
 ) -> Result<(), String> {
     let g = parse_group(&group)?;
     let node = state.inner().clone();
-    node.send_group_text(g, &body).await.map_err(|e| e.to_string())
+    node.send_group_text(g, &body)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_contacts(state: State<'_, NodeState>) -> Vec<ContactDto> {
+    let node = state.inner();
+    let online: std::collections::HashSet<String> = node
+        .connected_peers()
+        .into_iter()
+        .map(|p| hexkey(&p))
+        .collect();
+    node.contacts()
+        .into_iter()
+        .map(|c| {
+            let name = c.display_name().unwrap_or_else(|| {
+                vartalaap_identity::VartalaapId::from_bytes(c.peer)
+                    .map(|v| v.fingerprint().chars().take(8).collect())
+                    .unwrap_or_else(|_| hexkey(&c.peer).chars().take(8).collect())
+            });
+            ContactDto {
+                id: hexkey(&c.peer),
+                name,
+                online: online.contains(&hexkey(&c.peer)),
+                last_seen: c.last_seen,
+                unread: node.unread_direct(&c.peer),
+                pin_pending: c.pending_msg_key.is_some(),
+            }
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn list_nearby(state: State<'_, NodeState>) -> Vec<NearbyDto> {
+    state
+        .nearby()
+        .into_iter()
+        .map(|p| NearbyDto { id: hexkey(&p) })
+        .collect()
+}
+
+#[tauri::command]
+fn set_alias(
+    peer: String,
+    alias: Option<String>,
+    state: State<'_, NodeState>,
+) -> Result<(), String> {
+    let key = parse_key(&peer)?;
+    state.set_alias(key, alias);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_contact(peer: String, state: State<'_, NodeState>) -> Result<(), String> {
+    let key = parse_key(&peer)?;
+    state.remove_contact(key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn accept_new_key(peer: String, state: State<'_, NodeState>) -> Result<(), String> {
+    let key = parse_key(&peer)?;
+    state.accept_new_key(key);
+    Ok(())
+}
+
+#[tauri::command]
+async fn mark_read(kind: String, id: String, state: State<'_, NodeState>) -> Result<(), String> {
+    match kind.as_str() {
+        "peer" => {
+            let key = parse_key(&id)?;
+            let node = state.inner().clone();
+            node.mark_read_direct(key).await;
+            Ok(())
+        }
+        "group" => {
+            // Parse the 16-byte group id the same way `group_history` already
+            // does, via the same `parse_group` helper.
+            let gid = parse_group(&id)?;
+            state.mark_read_group(gid);
+            Ok(())
+        }
+        _ => Err("kind must be 'peer' or 'group'".into()),
+    }
 }
 
 /// Convert an engine event into a UI-friendly JSON payload and emit it.
@@ -298,6 +422,40 @@ fn emit_event(handle: &tauri::AppHandle, me: &[u8; 32], ev: EngineEvent) {
             "sent_at": message.sent_at,
             "mine": &message.author == me,
         }),
+        EngineEvent::StorageWarning { detail } => {
+            serde_json::json!({ "kind": "storage_warning", "detail": detail })
+        }
+        EngineEvent::ContactUpdated(peer) => {
+            serde_json::json!({ "kind": "contact_updated", "id": hexkey(&peer) })
+        }
+        EngineEvent::PinWarning {
+            peer,
+            old_fingerprint,
+            new_fingerprint,
+        } => serde_json::json!({
+            "kind": "pin_warning",
+            "id": hexkey(&peer),
+            "old": old_fingerprint,
+            "new": new_fingerprint,
+        }),
+        EngineEvent::HistorySynced { peer, scope, added } => {
+            let (scope_str, id) = match scope {
+                SyncScope::Direct => ("peer", hexkey(&peer)),
+                SyncScope::Group(gid) => ("group", hexgroup(&gid)),
+            };
+            serde_json::json!({
+                "kind": "history_synced",
+                "scope": scope_str,
+                "id": id,
+                "added": added,
+            })
+        }
+        EngineEvent::MessageStatus { peer, id, status } => serde_json::json!({
+            "kind": "message_status",
+            "peer": hexkey(&peer),
+            "id": hex::encode(id),
+            "status": status_str(status),
+        }),
     };
     let _ = handle.emit("engine://event", payload);
 }
@@ -344,7 +502,13 @@ pub fn run() {
             list_groups,
             create_group,
             group_history,
-            send_group
+            send_group,
+            list_contacts,
+            list_nearby,
+            set_alias,
+            remove_contact,
+            accept_new_key,
+            mark_read
         ])
         .run(tauri::generate_context!())
         .expect("error while running Vartalaap");
