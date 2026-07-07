@@ -384,6 +384,10 @@ mod tests {
         c.mark_read(BOB, 50);
         let mut r = Conversation::from_snapshot(c.snapshot());
         let m = r.create_text(ALICE, 2, "new");
-        assert!(m.lamport > 50, "new lamport {} must exceed watermark 50", m.lamport);
+        assert!(
+            m.lamport > 50,
+            "new lamport {} must exceed watermark 50",
+            m.lamport
+        );
     }
 }
