@@ -202,3 +202,31 @@ Message edit/delete (CRDT phase 2), multi-device identity, retention limits,
 hard-blocking on pin change, passphrase-entry screen (vault key remains the
 dev passphrase in `app/src-tauri/src/lib.rs`; separate future feature), and
 internet-wide (non-LAN) sync.
+
+## Implementation notes
+
+Reviewed-and-approved deviations/additions from this spec that landed during
+implementation (Tasks 1–12):
+
+- `Payload::Profile` is `Option<SignedProfile>` and is ALWAYS sent as the
+  post-connect beacon (guarantees the higher-id side's flush trigger even
+  with no profile set).
+- Delivery-ack round: `apply_delta` sends one fresh Direct-scope `SyncHave`
+  back after merging a non-empty delta (without it the sender of a queued
+  message never learns of delivery; bounded, terminates on empty deltas).
+- `IrohTransport::closed()` added to vartalaap-net so `Node::shutdown()`
+  deterministically drains the discovery loop and releases the vault.
+- Group-announce ack: a newly-learned group (announce OR invite) replies
+  with a SyncHave for that group so late-joining members backfill.
+- `send_group` Tauri command kept its unit return (group per-member
+  delivery status is out of scope).
+- Known residual (documented, future work): back-to-back sends immediately
+  after a fresh connect can lose the live MessageReceived event for the
+  second message due to pre-convergence session races — content always
+  heals via delta sync (HistorySynced); live GroupMessage/GroupInvite arms
+  remain membership-ungated pending group authenticity.
+- Delivered status is session-transient (peer_have); after a restart, own
+  delivered messages render as single-tick until the next sync round
+  restores the double tick.
+- Test suites run serially in constrained environments due to a
+  pre-existing iroh discovery flake under parallel load.

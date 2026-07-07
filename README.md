@@ -35,13 +35,19 @@ to you: a campus, an office, a LAN party, a workshop, a flight's local Wi-Fi.
 
 ## Features
 
-- 💬 **1:1 and group chat** with live presence, typing indicators, and read receipts
+- 💬 **1:1 and group chat** — persistent contacts, groups, and history, with live presence,
+  typing indicators, unread counts, and read receipts
+- 📮 **Offline-safe delivery** — messages sent to an offline peer queue locally and heal
+  automatically via CRDT delta sync on reconnect, with queued / sent / delivered status ticks
 - 🔒 **End-to-end encryption** (Olm/Double Ratchet) — forward secrecy + post-compromise security
 - 📡 **Automatic LAN discovery** (mDNS) — connect to a peer by identity alone, no IP addresses
 - 📎 **Send any file** — arbitrary files, encrypted end-to-end, integrity-verified
-- 👤 **Cryptographic identity + profiles** — your public key *is* your identity ("Vartalaap ID")
-- 🛡️ **Trust on first use (TOFU)** — peers are pinned; key changes are flagged
-- 🗄️ **Encrypted at rest** — local history is sealed with a passphrase-derived key
+- 👤 **Cryptographic identity + profiles** — your public key *is* your identity ("Vartalaap ID");
+  profiles exchange automatically on connect, with local aliases that override a peer's chosen name
+- 🛡️ **Trust on first use (TOFU)** — peers' keys are pinned on first contact; a later key change
+  is flagged with a warning
+- 🗄️ **Encrypted at rest** — contacts, groups, and conversation history persist locally, sealed
+  with a passphrase-derived key
 - 🖥️ **Cross-platform** — Linux, Windows, macOS, from one codebase
 
 ## How it works
@@ -174,8 +180,9 @@ vartalaap-v2/
 - [x] Group chat (small groups)
 - [x] End-to-end-encrypted file transfer
 - [x] Desktop GUI (Linux / Windows / macOS)
+- [x] Offline message delivery (CRDT delta sync heals on reconnect)
 - [ ] Voice / video calls
-- [ ] Offline store-and-forward (peer mailbox) & multi-device
+- [ ] Multi-device identity
 - [ ] Optional internet transport (DHT + hole-punching) for cross-network use
 
 ## Known limitations
