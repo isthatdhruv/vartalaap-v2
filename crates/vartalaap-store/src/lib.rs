@@ -97,10 +97,7 @@ impl Store {
 
     /// All entries whose key starts with `prefix`, with a per-entry decrypt
     /// result: one corrupt value must not hide the healthy ones.
-    pub fn list_secrets(
-        &self,
-        prefix: &str,
-    ) -> Result<SecretList, StoreError> {
+    pub fn list_secrets(&self, prefix: &str) -> Result<SecretList, StoreError> {
         let rtx = self
             .db
             .begin_read()
@@ -241,7 +238,9 @@ mod tests {
         let path = tmpdb();
         {
             let other = Store::open(&path, VaultKey::from([1u8; 32])).unwrap();
-            other.put_secret("convo/xx", b"sealed-under-other-key").unwrap();
+            other
+                .put_secret("convo/xx", b"sealed-under-other-key")
+                .unwrap();
         }
         let s = Store::open(&path, VaultKey::from([2u8; 32])).unwrap();
         let got = s.list_secrets("convo/").unwrap();
