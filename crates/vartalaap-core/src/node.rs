@@ -34,7 +34,7 @@ use vartalaap_net::{
 use vartalaap_sync::{Conversation, FileRef, Message, MessageKind};
 
 use crate::persist::Contact;
-pub use crate::protocol::{GroupId, GroupInfo, PeerKey};
+pub use crate::protocol::{GroupId, GroupInfo, PeerKey, SyncScope};
 use crate::protocol::{Payload, PendingFile, Wire};
 use crate::Engine;
 
@@ -86,6 +86,12 @@ pub enum EngineEvent {
         peer: PeerKey,
         old_fingerprint: String,
         new_fingerprint: String,
+    },
+    /// A delta sync with `peer` merged `added` missing messages for `scope`.
+    HistorySynced {
+        peer: PeerKey,
+        scope: SyncScope,
+        added: usize,
     },
 }
 
@@ -469,6 +475,22 @@ impl Node {
         Ok(())
     }
 
+    /// Record a text in the local replica without requiring a connection.
+    /// Delivery happens via delta sync on the next connect (Task 9 makes
+    /// send_text call this automatically when the peer is unreachable).
+    pub fn queue_local_text(&self, peer: PeerKey, body: &str) -> Result<Message> {
+        let now = now_millis();
+        let message = {
+            let mut st = self.ctx.state.lock().unwrap();
+            st.conversations
+                .entry(peer)
+                .or_default()
+                .create_text(self.id, now, body)
+        };
+        persist_convo(&self.ctx, &peer);
+        Ok(message)
+    }
+
     /// Send a file to a connected peer, end-to-end encrypted. The offer (which
     /// carries the per-file key) travels through the ratchet; the bytes stream
     /// separately, sealed with that key.
@@ -837,7 +859,39 @@ async fn post_connect(ctx: Arc<Ctx>, peer: PeerKey) {
         .as_ref()
         .and_then(|e| e.signed_profile().ok().flatten());
     let _ = send_payload_ctx(&ctx, peer, &Payload::Profile(signed)).await;
-    // Task 8 appends: GroupAnnounce for shared groups + SyncHave frames.
+
+    // 2) Announce shared groups + offer sync for every shared scope.
+    let (announces, haves) = {
+        let st = ctx.state.lock().unwrap();
+        let announces: Vec<GroupInfo> = st
+            .groups
+            .values()
+            .filter(|g| g.members.contains(&peer))
+            .cloned()
+            .collect();
+        let mut haves: Vec<(SyncScope, Vec<vartalaap_sync::MessageId>)> = Vec::new();
+        let direct_have = st
+            .conversations
+            .get(&peer)
+            .map(|c| c.have().into_iter().collect())
+            .unwrap_or_default();
+        haves.push((SyncScope::Direct, direct_have));
+        for g in &announces {
+            let ids = st
+                .group_convos
+                .get(&g.id)
+                .map(|c| c.have().into_iter().collect())
+                .unwrap_or_default();
+            haves.push((SyncScope::Group(g.id), ids));
+        }
+        (announces, haves)
+    };
+    for g in announces {
+        let _ = send_payload_ctx(&ctx, peer, &Payload::GroupAnnounce(g)).await;
+    }
+    for (scope, ids) in haves {
+        let _ = send_payload_ctx(&ctx, peer, &Payload::SyncHave { scope, ids }).await;
+    }
 }
 
 /// The higher-id side defers its post-connect sends until a session
@@ -997,14 +1051,22 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                 }
                 Payload::GroupInvite(info) => {
                     let id = info.id;
-                    {
+                    let inserted = {
                         let mut st = ctx.state.lock().unwrap();
+                        let fresh = !st.groups.contains_key(&id);
                         st.groups.entry(id).or_insert(info);
                         st.group_convos.entry(id).or_default();
-                    }
+                        fresh
+                    };
                     persist_group(ctx, &id);
                     persist_group_convo(ctx, &id);
                     let _ = ctx.events.send(EngineEvent::GroupInvited(id));
+                    if inserted {
+                        // A live invite can also arrive after messages we
+                        // missed (e.g. we were mid-reconnect); offer sync so
+                        // the inviter backfills our history for this group.
+                        offer_group_sync(ctx, peer, id);
+                    }
                 }
                 Payload::GroupMessage { group, message } => {
                     ctx.state
@@ -1051,6 +1113,46 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                         let _ = ctx.events.send(EngineEvent::ContactUpdated(peer));
                     }
                 }
+                Payload::GroupAnnounce(info) => {
+                    // Only meaningful if the sender and we are both members.
+                    if !info.members.contains(&peer) || !info.members.contains(&ctx.my_id) {
+                        return;
+                    }
+                    let id = info.id;
+                    let inserted = {
+                        let mut st = ctx.state.lock().unwrap();
+                        let fresh = !st.groups.contains_key(&id);
+                        st.groups.entry(id).or_insert(info);
+                        st.group_convos.entry(id).or_default();
+                        fresh
+                    };
+                    if inserted {
+                        persist_group(ctx, &id);
+                        persist_group_convo(ctx, &id);
+                        let _ = ctx.events.send(EngineEvent::GroupInvited(id));
+                        // We just learned this group exists, so our
+                        // post_connect sent no SyncHave for it. Offer one now
+                        // so the announcer backfills us — without this, a
+                        // late-joining member never receives missed history.
+                        offer_group_sync(ctx, peer, id);
+                    }
+                }
+                Payload::SyncHave { scope, ids } => {
+                    if let Some(delta) = build_delta(ctx, peer, scope, &ids) {
+                        let ctx2 = ctx.clone();
+                        tokio::spawn(async move {
+                            let _ = send_payload_ctx(&ctx2, peer, &delta).await;
+                        });
+                    }
+                }
+                Payload::SyncDelta {
+                    scope,
+                    messages,
+                    reactions,
+                    read,
+                } => {
+                    apply_delta(ctx, peer, scope, messages, reactions, read);
+                }
             }
         }
         Wire::Typing => {
@@ -1092,6 +1194,104 @@ fn apply_direct_message(peer: PeerKey, message: Message, ctx: &Arc<Ctx>) {
     let _ = ctx
         .events
         .send(EngineEvent::MessageReceived { peer, message });
+}
+
+/// Send a SyncHave for one group scope (used when we learn a group exists
+/// mid-connection, after post_connect already ran).
+fn offer_group_sync(ctx: &Arc<Ctx>, peer: PeerKey, gid: GroupId) {
+    let ids: Vec<vartalaap_sync::MessageId> = {
+        let st = ctx.state.lock().unwrap();
+        st.group_convos
+            .get(&gid)
+            .map(|c| c.have().into_iter().collect())
+            .unwrap_or_default()
+    };
+    let ctx2 = ctx.clone();
+    tokio::spawn(async move {
+        let _ = send_payload_ctx(
+            &ctx2,
+            peer,
+            &Payload::SyncHave {
+                scope: SyncScope::Group(gid),
+                ids,
+            },
+        )
+        .await;
+    });
+}
+
+/// Answer a peer's have-list with everything they're missing in `scope`.
+/// Returns None only when the scope is invalid (unknown/forbidden group).
+fn build_delta(
+    ctx: &Arc<Ctx>,
+    peer: PeerKey,
+    scope: SyncScope,
+    their_ids: &[vartalaap_sync::MessageId],
+) -> Option<Payload> {
+    let have: std::collections::BTreeSet<_> = their_ids.iter().copied().collect();
+    let st = ctx.state.lock().unwrap();
+    let convo = match scope {
+        SyncScope::Direct => st.conversations.get(&peer),
+        SyncScope::Group(gid) => {
+            let g = st.groups.get(&gid)?;
+            // Membership gate: never leak a group convo to a non-member.
+            if !g.members.contains(&peer) || !g.members.contains(&ctx.my_id) {
+                return None;
+            }
+            st.group_convos.get(&gid)
+        }
+    }?;
+    let snap = convo.snapshot();
+    Some(Payload::SyncDelta {
+        scope,
+        messages: convo.delta_since(&have),
+        reactions: snap.reactions,
+        read: snap.read,
+    })
+}
+
+/// Merge a received delta into the right conversation; one event per delta.
+fn apply_delta(
+    ctx: &Arc<Ctx>,
+    peer: PeerKey,
+    scope: SyncScope,
+    messages: Vec<Message>,
+    reactions: Vec<vartalaap_sync::Reaction>,
+    read: Vec<([u8; 32], u64)>,
+) {
+    let added = {
+        let mut st = ctx.state.lock().unwrap();
+        let convo = match scope {
+            SyncScope::Direct => st.conversations.entry(peer).or_default(),
+            SyncScope::Group(gid) => {
+                let Some(g) = st.groups.get(&gid) else {
+                    return;
+                };
+                if !g.members.contains(&peer) || !g.members.contains(&ctx.my_id) {
+                    return;
+                }
+                st.group_convos.entry(gid).or_default()
+            }
+        };
+        let before = convo.len();
+        for m in messages {
+            convo.apply(m);
+        }
+        for r in reactions {
+            convo.react(r.message, r.author, r.emoji);
+        }
+        for (author, lamport) in read {
+            convo.mark_read(author, lamport);
+        }
+        convo.len() - before
+    };
+    match scope {
+        SyncScope::Direct => persist_convo(ctx, &peer),
+        SyncScope::Group(gid) => persist_group_convo(ctx, &gid),
+    }
+    let _ = ctx
+        .events
+        .send(EngineEvent::HistorySynced { peer, scope, added });
 }
 
 /// Receive a blob stream: wait for the matching offer, decrypt each chunk to a
@@ -1700,6 +1900,129 @@ mod tests {
         let c = bob.contacts().into_iter().find(|c| c.peer == aid).unwrap();
         assert_ne!(c.pinned_msg_key, Some(first_key), "accept re-pins");
         assert!(c.pending_msg_key.is_none());
+        Ok(())
+    }
+
+    /// A text sent while the peer's node was down is delivered by delta sync
+    /// when the peer comes back — the CRDT is the outbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offline_message_heals_on_reconnect() -> Result<()> {
+        let seed_b = [92u8; 32];
+        let (alice, mut arx) = Node::start([91u8; 32]).await?;
+        let bid = {
+            let (bob, mut brx) = Node::start(seed_b).await?;
+            let bid = bob.id();
+            timeout(Duration::from_secs(20), alice.connect(bid))
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+            alice.send_text(bid, "seen live").await?;
+            wait_message(&mut brx).await;
+            bob.shutdown().await;
+            // Wait until alice notices the disconnect.
+            wait_for(
+                &mut arx,
+                |e| matches!(e, EngineEvent::PeerDisconnected(p) if *p == bid),
+            )
+            .await;
+            bid
+        };
+
+        // Peer is gone: author a message into the local replica. This task
+        // introduces queue_local_text for exactly this; Task 9 folds it into
+        // send_text (and rewrites this line — see Task 9 step 3b).
+        alice.queue_local_text(bid, "while you were out")?;
+
+        // Bob restarts with the same identity and reconnects.
+        let (bob2, mut brx2) = Node::start(seed_b).await?;
+        timeout(Duration::from_secs(20), alice.connect(bid))
+            .await
+            .map_err(|_| anyhow!("reconnect timed out"))??;
+        // Delta sync delivers the missed message.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match brx2.recv().await {
+                    Some(EngineEvent::HistorySynced { .. })
+                    | Some(EngineEvent::MessageReceived { .. }) => {
+                        if bob2
+                            .conversation_bodies(&alice.id())
+                            .contains(&"while you were out".to_string())
+                        {
+                            break;
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("sync never delivered the offline message"))?;
+        // And bob's copy of the LIVE message also survived his restart? No —
+        // bob2 is in-memory; what matters is the offline message arrived and
+        // both replicas converge for it.
+        assert!(bob2
+            .conversation_bodies(&alice.id())
+            .contains(&"while you were out".to_string()));
+        Ok(())
+    }
+
+    /// A group created while a member was offline reaches them via ANY
+    /// member (announce + delta ride every connection).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn group_heals_transitively_for_offline_member() -> Result<()> {
+        let seed_c = [95u8; 32];
+        let (alice, _arx) = Node::start([93u8; 32]).await?;
+        let (bob, mut brx) = Node::start([94u8; 32]).await?;
+        let (aid, bid) = (alice.id(), bob.id());
+        let cid = {
+            let (carol, _crx) = Node::start(seed_c).await?;
+            let cid = carol.id();
+            carol.shutdown().await; // carol is offline from the start
+            cid
+        };
+
+        timeout(Duration::from_secs(20), alice.connect(bid))
+            .await
+            .map_err(|_| anyhow!("a-b timeout"))??;
+        // Group created while carol is offline; only bob gets the invite.
+        let gid = alice.create_group("study".into(), vec![bid, cid]).await?;
+        wait_for(
+            &mut brx,
+            |e| matches!(e, EngineEvent::GroupInvited(g) if *g == gid),
+        )
+        .await;
+        alice.send_group_text(gid, "carol missed this").await?;
+        wait_for(
+            &mut brx,
+            |e| matches!(e, EngineEvent::GroupMessageReceived { group, .. } if *group == gid),
+        )
+        .await;
+
+        // Carol returns and connects to BOB (not the creator).
+        let (carol2, mut crx2) = Node::start(seed_c).await?;
+        timeout(Duration::from_secs(20), carol2.connect(bid))
+            .await
+            .map_err(|_| anyhow!("c-b timeout"))??;
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match crx2.recv().await {
+                    Some(EngineEvent::GroupInvited(g)) if g == gid => {}
+                    Some(EngineEvent::HistorySynced { .. })
+                    | Some(EngineEvent::GroupMessageReceived { .. }) => {
+                        if carol2.group_conversation(&gid).len() == 1 {
+                            break;
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("group never healed for carol"))?;
+        assert_eq!(carol2.groups().len(), 1);
+        assert_eq!(carol2.group_conversation(&gid)[0].body, "carol missed this");
+        let _ = aid;
         Ok(())
     }
 }

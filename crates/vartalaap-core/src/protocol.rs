@@ -40,6 +40,14 @@ pub struct GroupInfo {
     pub creator: PeerKey,
 }
 
+/// Which conversation a sync frame refers to.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SyncScope {
+    /// The 1:1 conversation between the two connected peers.
+    Direct,
+    Group(GroupId),
+}
+
 /// The plaintext carried inside a ratchet-encrypted [`Wire::Message`].
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Payload {
@@ -58,6 +66,21 @@ pub(crate) enum Payload {
     /// initiator rule in `node.rs`) unconditionally establishes a session,
     /// regardless of whether that peer has a profile to publish.
     Profile(Option<SignedProfile>),
+    /// A group this connection's peers share; heals members who were
+    /// offline at creation time. Idempotent.
+    GroupAnnounce(GroupInfo),
+    /// The message ids the sender already holds for `scope`.
+    SyncHave {
+        scope: SyncScope,
+        ids: Vec<vartalaap_sync::MessageId>,
+    },
+    /// Everything the receiver was missing for `scope`.
+    SyncDelta {
+        scope: SyncScope,
+        messages: Vec<Message>,
+        reactions: Vec<vartalaap_sync::Reaction>,
+        read: Vec<([u8; 32], u64)>,
+    },
 }
 
 /// A file we've been offered and expect a blob stream for.
