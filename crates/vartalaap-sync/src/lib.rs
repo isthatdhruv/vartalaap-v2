@@ -206,6 +206,45 @@ impl Conversation {
     }
 }
 
+/// A serializable snapshot of a [`Conversation`], used for encrypted
+/// persistence. Vec-based because serde_json cannot serialize the CRDT's
+/// byte-array-keyed maps directly.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Snapshot {
+    pub messages: Vec<Message>,
+    pub reactions: Vec<Reaction>,
+    pub read: Vec<(AuthorId, u64)>,
+}
+
+impl Conversation {
+    /// Capture the full conversation state.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            messages: self.messages.values().cloned().collect(),
+            reactions: self.reactions.iter().cloned().collect(),
+            read: self.read.iter().map(|(a, l)| (*a, *l)).collect(),
+        }
+    }
+
+    /// Rebuild a conversation from a snapshot. The local clock resumes past
+    /// every message lamport and read watermark, so newly-authored messages
+    /// sort after (and are never born already-read).
+    pub fn from_snapshot(s: Snapshot) -> Self {
+        let mut c = Conversation::new();
+        for m in s.messages {
+            c.apply(m);
+        }
+        for r in s.reactions {
+            c.reactions.insert(r);
+        }
+        for (a, l) in s.read {
+            c.mark_read(a, l);
+            c.lamport = c.lamport.max(l);
+        }
+        c
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +346,44 @@ mod tests {
         assert_eq!(a.len(), 2);
         assert_eq!(a.reactions_for(&m.id).len(), 1);
         assert_eq!(a.reactions_for(&n.id).len(), 1);
+    }
+
+    /// Snapshot → restore preserves messages, order, reactions, watermarks,
+    /// and lamport continuity (a message created after restore sorts last).
+    #[test]
+    fn snapshot_roundtrip_preserves_state_and_clock() {
+        let mut c = Conversation::new();
+        let m1 = c.create_text(ALICE, 100, "one");
+        let m2 = c.create_text(BOB, 101, "two");
+        c.react(m1.id, BOB, "👍");
+        c.mark_read(BOB, 7);
+
+        let snap = c.snapshot();
+        let json = serde_json::to_vec(&snap).expect("snapshot serializes");
+        let back: Snapshot = serde_json::from_slice(&json).expect("snapshot deserializes");
+        let mut r = Conversation::from_snapshot(back);
+
+        let ids: Vec<_> = r.messages_ordered().iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![m1.id, m2.id]);
+        assert_eq!(r.reactions_for(&m1.id).len(), 1);
+        assert_eq!(r.read_watermark(&BOB), 7);
+
+        // Clock continuity: a new message must sort after restored ones.
+        let m3 = r.create_text(ALICE, 102, "three");
+        let ids: Vec<_> = r.messages_ordered().iter().map(|m| m.id).collect();
+        assert_eq!(ids.last(), Some(&m3.id));
+        assert!(m3.lamport > m2.lamport);
+    }
+
+    /// The watermark can exceed message lamports; the restored clock must
+    /// cover it so fresh messages are never born already-read.
+    #[test]
+    fn snapshot_restores_clock_past_read_watermark() {
+        let mut c = Conversation::new();
+        c.create_text(ALICE, 1, "hi");
+        c.mark_read(BOB, 50);
+        let mut r = Conversation::from_snapshot(c.snapshot());
+        let m = r.create_text(ALICE, 2, "new");
+        assert!(m.lamport > 50, "new lamport {} must exceed watermark 50", m.lamport);
     }
 }
