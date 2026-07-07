@@ -12,6 +12,8 @@ use vartalaap_crypto::{open, seal, CryptoError, VaultKey};
 
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 
+type SecretList = Vec<(String, Result<Vec<u8>, CryptoError>)>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -98,7 +100,7 @@ impl Store {
     pub fn list_secrets(
         &self,
         prefix: &str,
-    ) -> Result<Vec<(String, Result<Vec<u8>, CryptoError>)>, StoreError> {
+    ) -> Result<SecretList, StoreError> {
         let rtx = self
             .db
             .begin_read()
