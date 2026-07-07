@@ -179,6 +179,13 @@ impl Engine {
             .store
             .put_secret(MSG_ACCOUNT_KEY, &acct.to_pickle_json())?)
     }
+
+    /// Persist an already-pickled messaging account. Callers should bind the
+    /// pickle bytes first and drop the account lock before calling this, so
+    /// the lock is never held during vault I/O.
+    pub fn save_msg_account_bytes(&self, bytes: &[u8]) -> Result<(), CoreError> {
+        Ok(self.store.put_secret(MSG_ACCOUNT_KEY, bytes)?)
+    }
 }
 
 fn parse_hex32_key(key: &str, prefix: &str) -> Option<[u8; 32]> {

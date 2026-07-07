@@ -387,7 +387,7 @@ impl Node {
         };
         persist_convo(&self.ctx, &peer);
         let plaintext = serde_json::to_vec(&Payload::Chat(message))?;
-        let ciphertext = self.encrypt_for(peer, &plaintext)?;
+        let ciphertext = encrypt_for(&self.ctx, peer, &plaintext)?;
 
         let frame = serde_json::to_vec(&Wire::Message { ciphertext })?;
         conn.send_frame(&frame).await?;
@@ -426,7 +426,7 @@ impl Node {
             message,
             key: meta.key,
         })?;
-        let ciphertext = self.encrypt_for(peer, &payload)?;
+        let ciphertext = encrypt_for(&self.ctx, peer, &payload)?;
 
         // 1) Send the encrypted offer.
         conn.send_frame(&serde_json::to_vec(&Wire::Message { ciphertext })?)
@@ -439,46 +439,6 @@ impl Node {
         }
         blob.finish().await?;
         Ok(())
-    }
-
-    /// Encrypt a payload for `peer`, using the existing ratchet session or
-    /// initiating a new one from the peer's published bundle.
-    fn encrypt_for(&self, peer: PeerKey, plaintext: &[u8]) -> Result<Vec<u8>> {
-        // Fast path: an established session already exists.
-        {
-            let mut st = self.ctx.state.lock().unwrap();
-            if let Some(session) = st.sessions.get_mut(&peer) {
-                return Ok(session.encrypt(plaintext)?);
-            }
-        }
-        // Slow path: create the outbound session. Hold `session_init` across the
-        // whole check-initiate-insert so two concurrent first-sends serialize:
-        // the loser re-observes the session the winner installed instead of
-        // initiating a *second* session the peer would never accept. (This
-        // method is fully synchronous, so no `.await` is held under the lock.)
-        let _init = self.ctx.session_init.lock().unwrap();
-        {
-            let mut st = self.ctx.state.lock().unwrap();
-            if let Some(session) = st.sessions.get_mut(&peer) {
-                return Ok(session.encrypt(plaintext)?);
-            }
-        }
-        let bundle = {
-            let st = self.ctx.state.lock().unwrap();
-            st.bundles.get(&peer).copied()
-        }
-        .ok_or_else(|| anyhow!("no pre-key bundle for peer; handshake incomplete"))?;
-        let (session, ciphertext) = {
-            let acct = self.ctx.messaging.lock().unwrap();
-            RatchetSession::initiate(&acct, &bundle, plaintext)?
-        };
-        self.ctx
-            .state
-            .lock()
-            .unwrap()
-            .sessions
-            .insert(peer, session);
-        Ok(ciphertext)
     }
 
     /// Send a frame to a connected peer.
@@ -530,15 +490,7 @@ impl Node {
 
     /// Encrypt a payload for `peer` and send it as a control frame.
     async fn send_payload(&self, peer: PeerKey, payload: &Payload) -> Result<()> {
-        let ciphertext = self.encrypt_for(peer, &serde_json::to_vec(payload)?)?;
-        let conn = {
-            let st = self.ctx.state.lock().unwrap();
-            st.conns.get(&peer).cloned()
-        }
-        .ok_or_else(|| anyhow!("no connection to peer"))?;
-        conn.send_frame(&serde_json::to_vec(&Wire::Message { ciphertext })?)
-            .await?;
-        Ok(())
+        send_payload_ctx(&self.ctx, peer, payload).await
     }
 
     /// Create a group (you are added automatically) and invite each member.
@@ -704,11 +656,72 @@ fn persist_contact(ctx: &Ctx, peer: &PeerKey) {
     }
 }
 
+/// Persist the messaging account after any mutation (bundle generation or a
+/// successful inbound session accept). Failures warn, never crash.
+fn persist_msg_account(ctx: &Ctx) {
+    let Some(engine) = &ctx.engine else { return };
+    let bytes = ctx.messaging.lock().unwrap().to_pickle_json();
+    if let Err(e) = engine.save_msg_account_bytes(&bytes) {
+        let _ = ctx.events.send(EngineEvent::StorageWarning {
+            detail: format!("failed to persist messaging account: {e}"),
+        });
+    }
+}
+
+/// Encrypt for `peer` on the existing session, or initiate one from the
+/// peer's published bundle. `session_init` serializes concurrent first-sends.
+fn encrypt_for(ctx: &Ctx, peer: PeerKey, plaintext: &[u8]) -> Result<Vec<u8>> {
+    // Fast path: an established session already exists.
+    {
+        let mut st = ctx.state.lock().unwrap();
+        if let Some(session) = st.sessions.get_mut(&peer) {
+            return Ok(session.encrypt(plaintext)?);
+        }
+    }
+    // Slow path: create the outbound session. Hold `session_init` across the
+    // whole check-initiate-insert so two concurrent first-sends serialize:
+    // the loser re-observes the session the winner installed instead of
+    // initiating a *second* session the peer would never accept. (This
+    // method is fully synchronous, so no `.await` is held under the lock.)
+    let _init = ctx.session_init.lock().unwrap();
+    {
+        let mut st = ctx.state.lock().unwrap();
+        if let Some(session) = st.sessions.get_mut(&peer) {
+            return Ok(session.encrypt(plaintext)?);
+        }
+    }
+    let bundle = {
+        let st = ctx.state.lock().unwrap();
+        st.bundles.get(&peer).copied()
+    }
+    .ok_or_else(|| anyhow!("no pre-key bundle for peer; handshake incomplete"))?;
+    let (session, ciphertext) = {
+        let acct = ctx.messaging.lock().unwrap();
+        RatchetSession::initiate(&acct, &bundle, plaintext)?
+    };
+    ctx.state.lock().unwrap().sessions.insert(peer, session);
+    Ok(ciphertext)
+}
+
+/// Encrypt a payload for `peer` and send it on the registered connection.
+async fn send_payload_ctx(ctx: &Arc<Ctx>, peer: PeerKey, payload: &Payload) -> Result<()> {
+    let ciphertext = encrypt_for(ctx, peer, &serde_json::to_vec(payload)?)?;
+    let conn = {
+        let st = ctx.state.lock().unwrap();
+        st.conns.get(&peer).cloned()
+    }
+    .ok_or_else(|| anyhow!("no connection to peer"))?;
+    conn.send_frame(&serde_json::to_vec(&Wire::Message { ciphertext })?)
+        .await?;
+    Ok(())
+}
+
 /// Perform the Hello handshake on a freshly-opened connection, then spawn a
 /// reader loop to service subsequent frames. Returns once the peer is known.
 async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
     // Send our Hello with a fresh pre-key bundle.
     let our_bundle = { ctx.messaging.lock().unwrap().prekey_bundle() };
+    persist_msg_account(&ctx);
     let hello = serde_json::to_vec(&Wire::Hello { bundle: our_bundle })?;
     conn.send_frame(&hello).await?;
 
@@ -788,6 +801,7 @@ async fn reader_loop(conn: Conn, peer: PeerKey, generation: u64, ctx: Arc<Ctx>) 
         if st.conn_gen.get(&peer).copied() == Some(generation) {
             st.conns.remove(&peer);
             st.conn_gen.remove(&peer);
+            st.sessions.remove(&peer); // sessions are per-connection
             if let Some(c) = st.contacts.get_mut(&peer) {
                 c.last_seen = now_millis();
             }
@@ -991,9 +1005,42 @@ async fn wait_for_offer(
 fn decrypt_payload(peer: PeerKey, ciphertext: &[u8], ctx: &Arc<Ctx>) -> Result<Payload> {
     let has_session = ctx.state.lock().unwrap().sessions.contains_key(&peer);
     let plaintext = if has_session {
-        let mut st = ctx.state.lock().unwrap();
-        let session = st.sessions.get_mut(&peer).unwrap();
-        session.decrypt(ciphertext)?
+        let attempt = {
+            let mut st = ctx.state.lock().unwrap();
+            let session = st.sessions.get_mut(&peer).unwrap();
+            session.decrypt(ciphertext)
+        };
+        match attempt {
+            Ok(p) => p,
+            // The peer initiated a competing session (both sides sent first
+            // messages concurrently, or the peer restarted). We always try to
+            // recover this message via a fresh accept — otherwise its content
+            // is silently and permanently lost, which is exactly the bug this
+            // task fixes. Deterministic winner for which session survives
+            // going forward: the initiation from the lexicographically LOWER
+            // id. We adopt theirs as our stored session only if they are the
+            // lower side; otherwise we keep our own stored session (so both
+            // sides converge on exactly one survivor) but still deliver the
+            // content we just recovered. Any remainder heals via delta sync
+            // (Task 8).
+            Err(_) if vartalaap_crypto::ratchet::is_prekey(ciphertext) => {
+                let their_identity_key = {
+                    let st = ctx.state.lock().unwrap();
+                    st.bundles.get(&peer).map(|b| b.identity_key)
+                }
+                .ok_or_else(|| anyhow!("no bundle for peer; cannot accept session"))?;
+                let (session, plaintext) = {
+                    let mut acct = ctx.messaging.lock().unwrap();
+                    RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
+                };
+                if peer < ctx.my_id {
+                    ctx.state.lock().unwrap().sessions.insert(peer, session);
+                }
+                persist_msg_account(ctx);
+                plaintext
+            }
+            Err(e) => return Err(e.into()),
+        }
     } else {
         let their_identity_key = {
             let st = ctx.state.lock().unwrap();
@@ -1005,6 +1052,7 @@ fn decrypt_payload(peer: PeerKey, ciphertext: &[u8], ctx: &Arc<Ctx>) -> Result<P
             RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
         };
         ctx.state.lock().unwrap().sessions.insert(peer, session);
+        persist_msg_account(ctx);
         plaintext
     };
     Ok(serde_json::from_slice(&plaintext)?)
@@ -1308,6 +1356,37 @@ mod tests {
         assert_eq!(contacts[0].peer, bob_id);
         alice2.shutdown().await;
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// Both sides send their FIRST message concurrently: each initiates its
+    /// own session. Without the PreKey fallback + tie-break this deadlocks
+    /// (all subsequent messages silently dropped both ways). With it, both
+    /// sides converge on one session and later messages flow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_sends_do_not_deadlock() -> Result<()> {
+        let (alice, mut alice_rx) = Node::start([71u8; 32]).await?;
+        let (bob, mut bob_rx) = Node::start([72u8; 32]).await?;
+        let (aid, bid) = (alice.id(), bob.id());
+
+        timeout(Duration::from_secs(20), alice.connect(bid))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+
+        // Fire the first messages truly concurrently.
+        let (ra, rb) = tokio::join!(alice.send_text(bid, "a1"), bob.send_text(aid, "b1"));
+        ra?;
+        rb?;
+
+        // Regardless of which first message won, LATER messages must flow
+        // both directions (the deadlock symptom is: nothing ever arrives).
+        alice.send_text(bid, "a2").await?;
+        let got = wait_message(&mut bob_rx).await;
+        assert!(got.body == "a1" || got.body == "a2");
+
+        bob.send_text(aid, "b2").await?;
+        let got = wait_message(&mut alice_rx).await;
+        assert!(got.body == "b1" || got.body == "b2");
         Ok(())
     }
 }
