@@ -324,6 +324,13 @@ fn accept_new_key(peer: String, state: State<'_, NodeState>) -> Result<(), Strin
     Ok(())
 }
 
+/// Vault load-quarantine warnings recorded before the frontend had a chance
+/// to subscribe to the event stream, so they aren't just silently dropped.
+#[tauri::command]
+fn startup_warnings(state: State<'_, NodeState>) -> Vec<String> {
+    state.startup_warnings()
+}
+
 #[tauri::command]
 async fn mark_read(kind: String, id: String, state: State<'_, NodeState>) -> Result<(), String> {
     match kind.as_str() {
@@ -495,7 +502,8 @@ pub fn run() {
             set_alias,
             remove_contact,
             accept_new_key,
-            mark_read
+            mark_read,
+            startup_warnings
         ])
         .run(tauri::generate_context!())
         .expect("error while running Vartalaap");
