@@ -453,7 +453,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            let data_dir = app.path().app_data_dir().expect("resolve app data dir");
+            let data_dir = std::env::var("VARTALAAP_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| app.path().app_data_dir().expect("resolve app data dir"));
             std::fs::create_dir_all(&data_dir).ok();
 
             // Start the headless engine (binds LAN transport + discovery).
