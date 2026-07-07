@@ -648,6 +648,61 @@ impl Node {
         self.send_to(peer, &Wire::Read { up_to }).await
     }
 
+    /// Unread = messages from others above our own read watermark.
+    pub fn unread_direct(&self, peer: &PeerKey) -> usize {
+        let st = self.ctx.state.lock().unwrap();
+        let Some(c) = st.conversations.get(peer) else {
+            return 0;
+        };
+        let mine = c.read_watermark(&self.id);
+        c.messages_ordered()
+            .iter()
+            .filter(|m| m.author != self.id && m.lamport > mine)
+            .count()
+    }
+
+    pub fn unread_group(&self, gid: &GroupId) -> usize {
+        let st = self.ctx.state.lock().unwrap();
+        let Some(c) = st.group_convos.get(gid) else {
+            return 0;
+        };
+        let mine = c.read_watermark(&self.id);
+        c.messages_ordered()
+            .iter()
+            .filter(|m| m.author != self.id && m.lamport > mine)
+            .count()
+    }
+
+    /// Mark the whole 1:1 conversation read; tell the peer if reachable.
+    pub async fn mark_read_direct(&self, peer: PeerKey) {
+        let up_to = {
+            let mut st = self.ctx.state.lock().unwrap();
+            let Some(c) = st.conversations.get_mut(&peer) else {
+                return;
+            };
+            let max = c.messages_ordered().last().map(|m| m.lamport).unwrap_or(0);
+            let me = self.id;
+            c.mark_read(me, max);
+            max
+        };
+        persist_convo(&self.ctx, &peer);
+        let _ = self.send_to(peer, &Wire::Read { up_to }).await; // best-effort
+    }
+
+    /// Mark a group conversation read locally (spreads via delta sync).
+    pub fn mark_read_group(&self, gid: GroupId) {
+        {
+            let mut st = self.ctx.state.lock().unwrap();
+            let Some(c) = st.group_convos.get_mut(&gid) else {
+                return;
+            };
+            let max = c.messages_ordered().last().map(|m| m.lamport).unwrap_or(0);
+            let me = self.id;
+            c.mark_read(me, max);
+        }
+        persist_group_convo(&self.ctx, &gid);
+    }
+
     /// A snapshot of the messages in the conversation with `peer`, ordered.
     pub fn conversation_bodies(&self, peer: &PeerKey) -> Vec<String> {
         let st = self.ctx.state.lock().unwrap();
@@ -2242,6 +2297,30 @@ mod tests {
         assert_eq!(carol2.groups().len(), 1);
         assert_eq!(carol2.group_conversation(&gid)[0].body, "carol missed this");
         let _ = aid;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unread_counts_and_mark_read() -> Result<()> {
+        let (alice, _arx) = Node::start([111u8; 32]).await?;
+        let (bob, mut brx) = Node::start([112u8; 32]).await?;
+        let (aid, bid) = (alice.id(), bob.id());
+        timeout(Duration::from_secs(20), alice.connect(bid))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+
+        // Give the connection a moment to stabilize
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        alice.send_text(bid, "one").await?;
+        alice.send_text(bid, "two").await?;
+        wait_message(&mut brx).await;
+        wait_message(&mut brx).await;
+
+        assert_eq!(bob.unread_direct(&aid), 2);
+        assert_eq!(alice.unread_direct(&bid), 0, "own messages are not unread");
+        bob.mark_read_direct(aid).await;
+        assert_eq!(bob.unread_direct(&aid), 0);
         Ok(())
     }
 
