@@ -78,6 +78,15 @@ pub enum EngineEvent {
     /// A vault read/write problem the user should know about (load quarantine
     /// or write failure). The app keeps running on in-memory state.
     StorageWarning { detail: String },
+    /// A contact's stored data (profile/alias/pin/last-seen) changed.
+    ContactUpdated(PeerKey),
+    /// The peer's messaging key differs from the TOFU pin. Sending remains
+    /// enabled; the new key takes effect only after accept_new_key().
+    PinWarning {
+        peer: PeerKey,
+        old_fingerprint: String,
+        new_fingerprint: String,
+    },
 }
 
 #[derive(Default)]
@@ -103,6 +112,9 @@ struct State {
     group_convos: HashMap<GroupId, Conversation>,
     /// Known contacts: peers we've completed at least one handshake with.
     contacts: HashMap<PeerKey, Contact>,
+    /// Peers for whom we deferred the post-connect send sequence because no
+    /// session existed yet (we are the higher-id side; see `post_connect`).
+    pending_post_connect: BTreeSet<PeerKey>,
 }
 
 /// Shared connection-handling context: every free function that services a
@@ -328,6 +340,25 @@ impl Node {
         match &self.ctx.engine {
             Some(e) => {
                 e.set_profile(profile)?;
+                if let Some(engine) = &self.ctx.engine {
+                    if let Ok(Some(signed)) = engine.signed_profile() {
+                        let peers: Vec<PeerKey> = {
+                            let st = self.ctx.state.lock().unwrap();
+                            st.conns.keys().copied().collect()
+                        };
+                        let ctx = self.ctx.clone();
+                        tokio::spawn(async move {
+                            for peer in peers {
+                                let _ = send_payload_ctx(
+                                    &ctx,
+                                    peer,
+                                    &Payload::Profile(Some(signed.clone())),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                }
                 Ok(())
             }
             None => Err(anyhow!("this node has no persistent store")),
@@ -355,6 +386,50 @@ impl Node {
         profile.display_name = name;
         profile.updated_at = now_millis();
         self.set_profile(profile)
+    }
+
+    /// Set or clear the local alias for a contact.
+    pub fn set_alias(&self, peer: PeerKey, alias: Option<String>) {
+        {
+            let mut st = self.ctx.state.lock().unwrap();
+            if let Some(c) = st.contacts.get_mut(&peer) {
+                c.alias = alias;
+            } else {
+                return;
+            }
+        }
+        persist_contact(&self.ctx, &peer);
+        let _ = self.ctx.events.send(EngineEvent::ContactUpdated(peer));
+    }
+
+    /// Forget a contact and its conversation (vault + memory).
+    pub fn remove_contact(&self, peer: PeerKey) -> Result<()> {
+        {
+            let mut st = self.ctx.state.lock().unwrap();
+            st.contacts.remove(&peer);
+            st.conversations.remove(&peer);
+        }
+        if let Some(e) = &self.ctx.engine {
+            e.delete_contact(&peer)?;
+        }
+        let _ = self.ctx.events.send(EngineEvent::ContactUpdated(peer));
+        Ok(())
+    }
+
+    /// Accept a changed messaging key: promote pending → pinned.
+    pub fn accept_new_key(&self, peer: PeerKey) {
+        {
+            let mut st = self.ctx.state.lock().unwrap();
+            if let Some(c) = st.contacts.get_mut(&peer) {
+                if let Some(k) = c.pending_msg_key.take() {
+                    c.pinned_msg_key = Some(k);
+                }
+            } else {
+                return;
+            }
+        }
+        persist_contact(&self.ctx, &peer);
+        let _ = self.ctx.events.send(EngineEvent::ContactUpdated(peer));
     }
 
     /// Connect to a peer by Vartalaap ID, performing the handshake. Resolves the
@@ -656,6 +731,38 @@ fn persist_contact(ctx: &Ctx, peer: &PeerKey) {
     }
 }
 
+/// TOFU: pin the first-seen messaging key; flag any later change.
+fn check_pin(ctx: &Arc<Ctx>, peer: PeerKey, bundle_identity_key: [u8; 32]) {
+    let event = {
+        let mut st = ctx.state.lock().unwrap();
+        let Some(c) = st.contacts.get_mut(&peer) else {
+            return;
+        };
+        match c.pinned_msg_key {
+            None => {
+                c.pinned_msg_key = Some(bundle_identity_key);
+                None
+            }
+            Some(pinned) if pinned == bundle_identity_key => {
+                c.pending_msg_key = None;
+                None
+            }
+            Some(pinned) => {
+                c.pending_msg_key = Some(bundle_identity_key);
+                Some(EngineEvent::PinWarning {
+                    peer,
+                    old_fingerprint: hex::encode(&pinned[..8]),
+                    new_fingerprint: hex::encode(&bundle_identity_key[..8]),
+                })
+            }
+        }
+    };
+    persist_contact(ctx, &peer);
+    if let Some(e) = event {
+        let _ = ctx.events.send(e);
+    }
+}
+
 /// Persist the messaging account after any mutation (bundle generation or a
 /// successful inbound session accept). Failures warn, never crash.
 fn persist_msg_account(ctx: &Ctx) {
@@ -716,6 +823,36 @@ async fn send_payload_ctx(ctx: &Arc<Ctx>, peer: PeerKey, payload: &Payload) -> R
     Ok(())
 }
 
+/// Connect-time exchange. The lower-id side runs this immediately; the
+/// higher-id side runs it once a session is established (initiator rule).
+async fn post_connect(ctx: Arc<Ctx>, peer: PeerKey) {
+    // 1) Publish our signed profile (or explicitly "none yet"). This send is
+    // unconditional — not just when we have a profile — because it is also
+    // the lower-id side's deterministic session-establishing message: the
+    // higher side's `maybe_flush_post_connect` only fires once a session
+    // exists, so if the lower side stayed silent here (e.g. no profile set),
+    // the higher side would defer forever and never flush its own profile.
+    let signed = ctx
+        .engine
+        .as_ref()
+        .and_then(|e| e.signed_profile().ok().flatten());
+    let _ = send_payload_ctx(&ctx, peer, &Payload::Profile(signed)).await;
+    // Task 8 appends: GroupAnnounce for shared groups + SyncHave frames.
+}
+
+/// The higher-id side defers its post-connect sends until a session
+/// exists (the lower side initiates), then flushes exactly once.
+fn maybe_flush_post_connect(ctx: &Arc<Ctx>, peer: PeerKey) {
+    let should = {
+        let mut st = ctx.state.lock().unwrap();
+        st.sessions.contains_key(&peer) && st.pending_post_connect.remove(&peer)
+    };
+    if should {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { post_connect(ctx, peer).await });
+    }
+}
+
 /// Perform the Hello handshake on a freshly-opened connection, then spawn a
 /// reader loop to service subsequent frames. Returns once the peer is known.
 async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
@@ -753,7 +890,7 @@ async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
             peer,
             profile: None,
             alias: None,
-            pinned_msg_key: None, // pinned in Task 7
+            pinned_msg_key: None, // pinned by check_pin below
             pending_msg_key: None,
             last_seen: now,
             added_at: now,
@@ -762,8 +899,21 @@ async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
         (generation, is_new)
     };
     persist_contact(&ctx, &peer);
-    let _ = is_new_contact; // used by Task 7's ContactUpdated event
+    check_pin(&ctx, peer, bundle.identity_key);
+    if is_new_contact {
+        let _ = ctx.events.send(EngineEvent::ContactUpdated(peer));
+    }
     let _ = ctx.events.send(EngineEvent::PeerConnected(peer));
+
+    // Initiator rule: the lower-id side sends first, so the higher side
+    // always has a session to decrypt into by the time it flushes its own
+    // deferred post-connect sends (see `maybe_flush_post_connect`).
+    if ctx.my_id < peer {
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move { post_connect(ctx2, peer).await });
+    } else {
+        ctx.state.lock().unwrap().pending_post_connect.insert(peer);
+    }
 
     // Service the rest of the connection in the background.
     tokio::spawn(async move {
@@ -813,6 +963,7 @@ async fn reader_loop(conn: Conn, peer: PeerKey, generation: u64, ctx: Arc<Ctx>) 
     if was_current {
         persist_contact(&ctx, &peer);
         let _ = ctx.events.send(EngineEvent::PeerDisconnected(peer));
+        let _ = ctx.events.send(EngineEvent::ContactUpdated(peer));
     }
 }
 
@@ -820,12 +971,15 @@ async fn reader_loop(conn: Conn, peer: PeerKey, generation: u64, ctx: Arc<Ctx>) 
 fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
     match wire {
         Wire::Hello { bundle } => {
+            let identity_key = bundle.identity_key;
             ctx.state.lock().unwrap().bundles.insert(peer, bundle);
+            check_pin(ctx, peer, identity_key);
         }
         Wire::Message { ciphertext } => {
             let Ok(payload) = decrypt_payload(peer, &ciphertext, ctx) else {
                 return;
             };
+            maybe_flush_post_connect(ctx, peer);
             match payload {
                 Payload::Chat(message) => apply_direct_message(peer, message, ctx),
                 Payload::FileOffer { message, key } => {
@@ -864,6 +1018,38 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                     let _ = ctx
                         .events
                         .send(EngineEvent::GroupMessageReceived { group, message });
+                }
+                // `None` means "no profile yet" — the sender still had to
+                // transmit *something* to establish the session (see
+                // `post_connect`), so there is nothing further to do here.
+                Payload::Profile(None) => {}
+                Payload::Profile(Some(signed)) => {
+                    let Ok((vid, profile)) = signed.verify() else {
+                        return;
+                    };
+                    // The profile must be signed by the connected peer itself.
+                    if vid.to_bytes() != peer {
+                        return;
+                    }
+                    let updated = {
+                        let mut st = ctx.state.lock().unwrap();
+                        let Some(c) = st.contacts.get_mut(&peer) else {
+                            return;
+                        };
+                        let newer = c
+                            .profile
+                            .as_ref()
+                            .map(|p| profile.updated_at > p.updated_at)
+                            .unwrap_or(true);
+                        if newer {
+                            c.profile = Some(profile.clone());
+                        }
+                        newer
+                    };
+                    if updated {
+                        persist_contact(ctx, &peer);
+                        let _ = ctx.events.send(EngineEvent::ContactUpdated(peer));
+                    }
                 }
             }
         }
@@ -1392,6 +1578,128 @@ mod tests {
         bob.send_text(aid, "b2").await?;
         let got = wait_message(&mut alice_rx).await;
         assert!(got.body == "b1" || got.body == "b2");
+        Ok(())
+    }
+
+    fn tmp_data_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let n: u64 = rand::random();
+        p.push(format!("vartalaap-{tag}-{n}"));
+        p
+    }
+
+    /// Profiles propagate on connect; alias overrides the profile name; the
+    /// messaging key is pinned on first contact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn profile_exchange_and_alias_precedence() -> Result<()> {
+        let dir_a = tmp_data_dir("profile-a");
+        let dir_b = tmp_data_dir("profile-b");
+        let (alice, _arx) = Node::start_persistent(&dir_a, "pw").await?;
+        alice.set_display_name("Asha".into())?;
+        let (bob, mut brx) = Node::start_persistent(&dir_b, "pw").await?;
+        let aid = alice.id();
+
+        timeout(Duration::from_secs(20), bob.connect(aid))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+        // Bob emits ContactUpdated both for the new-contact upsert (which
+        // fires synchronously during the handshake) and, separately, once
+        // Alice's profile lands via post_connect (asynchronous). The first
+        // ContactUpdated to arrive may not carry the profile yet, so loop
+        // until the display name actually shows up rather than asserting on
+        // the first event (adapted from the brief's single `wait_for` to
+        // avoid a race between the two ContactUpdated causes).
+        timeout(Duration::from_secs(20), async {
+            loop {
+                wait_for(
+                    &mut brx,
+                    |e| matches!(e, EngineEvent::ContactUpdated(p) if *p == aid),
+                )
+                .await;
+                let has_profile = bob
+                    .contacts()
+                    .into_iter()
+                    .find(|c| c.peer == aid)
+                    .is_some_and(|c| c.display_name().as_deref() == Some("Asha"));
+                if has_profile {
+                    break;
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timed out waiting for alice's profile to land"))?;
+
+        let contact = bob
+            .contacts()
+            .into_iter()
+            .find(|c| c.peer == aid)
+            .expect("alice is a contact");
+        assert_eq!(contact.display_name().as_deref(), Some("Asha"));
+        assert!(
+            contact.pinned_msg_key.is_some(),
+            "first bundle key is pinned"
+        );
+
+        bob.set_alias(aid, Some("roomie".into()));
+        let contact = bob.contacts().into_iter().find(|c| c.peer == aid).unwrap();
+        assert_eq!(contact.display_name().as_deref(), Some("roomie"));
+
+        alice.shutdown().await;
+        bob.shutdown().await;
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
+        Ok(())
+    }
+
+    /// A peer reappearing with the same node id but a different messaging
+    /// key (fresh in-memory account, same seed) triggers PinWarning, and
+    /// accept_new_key() re-pins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn changed_messaging_key_raises_pin_warning() -> Result<()> {
+        let (bob, mut brx) = Node::start([82u8; 32]).await?;
+        let seed = [81u8; 32];
+        let first_key = {
+            let (alice, _arx) = Node::start(seed).await?;
+            timeout(Duration::from_secs(20), bob.connect(alice.id()))
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+            wait_for(
+                &mut brx,
+                |e| matches!(e, EngineEvent::PeerConnected(p) if *p == alice.id()),
+            )
+            .await;
+            let c = bob
+                .contacts()
+                .into_iter()
+                .find(|c| c.peer == alice.id())
+                .unwrap();
+            alice.shutdown().await;
+            c.pinned_msg_key.expect("pinned on first connect")
+        };
+
+        // Same identity seed → same PeerId, but a fresh MessagingAccount.
+        let (alice2, _arx) = Node::start(seed).await?;
+        let aid = alice2.id();
+        timeout(Duration::from_secs(20), bob.connect(aid))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+        wait_for(
+            &mut brx,
+            |e| matches!(e, EngineEvent::PinWarning { peer, .. } if *peer == aid),
+        )
+        .await;
+        let c = bob.contacts().into_iter().find(|c| c.peer == aid).unwrap();
+        assert_eq!(
+            c.pinned_msg_key,
+            Some(first_key),
+            "old pin kept until accepted"
+        );
+        assert!(c.pending_msg_key.is_some());
+
+        bob.accept_new_key(aid);
+        let c = bob.contacts().into_iter().find(|c| c.peer == aid).unwrap();
+        assert_ne!(c.pinned_msg_key, Some(first_key), "accept re-pins");
+        assert!(c.pending_msg_key.is_none());
         Ok(())
     }
 }

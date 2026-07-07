@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use vartalaap_crypto::ratchet::PreKeyBundle;
+use vartalaap_identity::SignedProfile;
 use vartalaap_sync::Message;
 
 /// A peer's stable id: the 32-byte Vartalaap ID / Iroh PeerId.
@@ -51,6 +52,12 @@ pub(crate) enum Payload {
     GroupInvite(GroupInfo),
     /// A message addressed to a group (fanned out pairwise to each member).
     GroupMessage { group: GroupId, message: Message },
+    /// The sender's signed profile, published on connect and on change.
+    /// `None` when the sender has not set a profile yet — still sent (rather
+    /// than omitted) so the connect-time send from the lower-id peer (see the
+    /// initiator rule in `node.rs`) unconditionally establishes a session,
+    /// regardless of whether that peer has a profile to publish.
+    Profile(Option<SignedProfile>),
 }
 
 /// A file we've been offered and expect a blob stream for.
