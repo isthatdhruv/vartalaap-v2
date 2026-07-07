@@ -2302,15 +2302,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unread_counts_and_mark_read() -> Result<()> {
-        let (alice, _arx) = Node::start([111u8; 32]).await?;
+        let (alice, mut arx) = Node::start([111u8; 32]).await?;
         let (bob, mut brx) = Node::start([112u8; 32]).await?;
         let (aid, bid) = (alice.id(), bob.id());
         timeout(Duration::from_secs(20), alice.connect(bid))
             .await
             .map_err(|_| anyhow!("connect timed out"))??;
 
-        // Give the connection a moment to stabilize
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Deterministic barrier: the first delta-sync round-trip completing
+        // proves the ratchet session converged both ways, so subsequent
+        // sends cannot cross-initiate (and thus cannot lose live events).
+        wait_for(
+            &mut arx,
+            |e| matches!(e, EngineEvent::HistorySynced { peer, .. } if *peer == bid),
+        )
+        .await;
 
         alice.send_text(bid, "one").await?;
         alice.send_text(bid, "two").await?;
