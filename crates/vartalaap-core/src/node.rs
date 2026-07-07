@@ -80,8 +80,12 @@ pub enum EngineEvent {
     StorageWarning { detail: String },
     /// A contact's stored data (profile/alias/pin/last-seen) changed.
     ContactUpdated(PeerKey),
-    /// The peer's messaging key differs from the TOFU pin. Sending remains
-    /// enabled; the new key takes effect only after accept_new_key().
+    /// The peer's messaging key differs from the TOFU pin. This is a
+    /// warn-only signal: the session already encrypts/decrypts with the
+    /// peer's latest published key regardless of this pin, so sending and
+    /// receiving are unaffected either way; accept_new_key() only re-pins
+    /// the record (silencing future warnings), it does not gate which key
+    /// is used for messaging.
     PinWarning {
         peer: PeerKey,
         old_fingerprint: String,
