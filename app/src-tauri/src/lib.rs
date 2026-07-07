@@ -40,11 +40,6 @@ struct WhoAmI {
 }
 
 #[derive(Serialize)]
-struct PeerDto {
-    id: String,
-}
-
-#[derive(Serialize)]
 struct FileDto {
     name: String,
     size: u64,
@@ -145,15 +140,6 @@ fn whoami(state: State<'_, NodeState>) -> WhoAmI {
 #[tauri::command]
 fn set_display_name(name: String, state: State<'_, NodeState>) -> Result<(), String> {
     state.set_display_name(name).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn list_peers(state: State<'_, NodeState>) -> Vec<PeerDto> {
-    state
-        .discovered_peers()
-        .iter()
-        .map(|k| PeerDto { id: hexkey(k) })
-        .collect()
 }
 
 #[tauri::command]
@@ -491,7 +477,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             whoami,
             set_display_name,
-            list_peers,
             history,
             connect,
             send,
