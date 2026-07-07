@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
 use vartalaap_crypto::{open, seal, CryptoError, VaultKey};
 
@@ -92,6 +92,74 @@ impl Store {
                 .map_err(|_| StoreError::Serde),
         }
     }
+
+    /// All entries whose key starts with `prefix`, with a per-entry decrypt
+    /// result: one corrupt value must not hide the healthy ones.
+    pub fn list_secrets(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, Result<Vec<u8>, CryptoError>)>, StoreError> {
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let t = rtx
+            .open_table(SECRETS)
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in t
+            .range::<&str>(prefix..)
+            .map_err(|e| StoreError::Db(e.to_string()))?
+        {
+            let (k, v) = entry.map_err(|e| StoreError::Db(e.to_string()))?;
+            let key = k.value().to_string();
+            if !key.starts_with(prefix) {
+                break; // keys are ordered; past the prefix range
+            }
+            out.push((key, open(&self.key, v.value())));
+        }
+        Ok(out)
+    }
+
+    /// Remove an entry (no-op if absent).
+    pub fn delete_secret(&self, name: &str) -> Result<(), StoreError> {
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(SECRETS)
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+            t.remove(name).map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+        wtx.commit().map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Move an entry's raw sealed bytes to `corrupt/<name>` (preserving the
+    /// evidence) and delete the original. Used when a value fails to decrypt
+    /// or deserialize, so startup never crashes and never silently destroys.
+    pub fn quarantine(&self, name: &str) -> Result<(), StoreError> {
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(SECRETS)
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+            let raw = match t.get(name).map_err(|e| StoreError::Db(e.to_string()))? {
+                Some(v) => v.value().to_vec(),
+                None => return Ok(()), // nothing to quarantine
+            };
+            t.insert(format!("corrupt/{name}").as_str(), raw.as_slice())
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+            t.remove(name).map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+        wtx.commit().map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +204,54 @@ mod tests {
         s.put_json("nums", &vec![1u32, 2, 3]).unwrap();
         let got: Vec<u32> = s.get_json("nums").unwrap().unwrap();
         assert_eq!(got, vec![1, 2, 3]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn list_secrets_returns_prefix_matches_only() {
+        let path = tmpdb();
+        let s = Store::open(&path, VaultKey::from([7u8; 32])).unwrap();
+        s.put_secret("contact/aa", b"a").unwrap();
+        s.put_secret("contact/bb", b"b").unwrap();
+        s.put_secret("convo/aa", b"c").unwrap();
+        let got = s.list_secrets("contact/").unwrap();
+        let mut keys: Vec<_> = got.iter().map(|(k, _)| k.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["contact/aa", "contact/bb"]);
+        assert!(got.iter().all(|(_, v)| v.is_ok()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_secret_removes_entry() {
+        let path = tmpdb();
+        let s = Store::open(&path, VaultKey::from([7u8; 32])).unwrap();
+        s.put_secret("gone", b"x").unwrap();
+        s.delete_secret("gone").unwrap();
+        assert!(s.get_secret("gone").unwrap().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A value sealed under a different key fails to decrypt; list_secrets
+    /// surfaces it per-entry and quarantine moves it aside.
+    #[test]
+    fn corrupt_value_is_reported_and_quarantined() {
+        let path = tmpdb();
+        {
+            let other = Store::open(&path, VaultKey::from([1u8; 32])).unwrap();
+            other.put_secret("convo/xx", b"sealed-under-other-key").unwrap();
+        }
+        let s = Store::open(&path, VaultKey::from([2u8; 32])).unwrap();
+        let got = s.list_secrets("convo/").unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.is_err(), "wrong-key value must fail decryption");
+
+        s.quarantine("convo/xx").unwrap();
+        assert!(s.get_secret("convo/xx").unwrap().is_none());
+        assert!(s.list_secrets("convo/").unwrap().is_empty());
+        // The raw bytes were preserved under the quarantine prefix.
+        let q = s.list_secrets("corrupt/convo/xx").unwrap();
+        assert_eq!(q.len(), 1);
         std::fs::remove_file(&path).ok();
     }
 }
