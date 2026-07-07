@@ -53,12 +53,13 @@ async fn main() -> Result<()> {
     println!("  ✔ connected + handshaked (TOFU pinned)\n");
 
     println!("Alice → Bob: \"Hello from Alice 👋\"");
-    alice.send_text(bob_id, "Hello from Alice 👋").await?;
+    let _ = alice.send_text(bob_id, "Hello from Alice 👋").await?;
     let (body, from) = next_message(&mut bob_rx).await?;
     println!("  ✔ Bob decrypted from {}: \"{}\"\n", short(&from), body);
 
     println!("Bob → Alice: \"Hi Alice, this is end-to-end encrypted 🔒\"");
-    bob.send_text(alice_id, "Hi Alice, this is end-to-end encrypted 🔒")
+    let _ = bob
+        .send_text(alice_id, "Hi Alice, this is end-to-end encrypted 🔒")
         .await?;
     let (body, from) = next_message(&mut alice_rx).await?;
     println!("  ✔ Alice decrypted from {}: \"{}\"\n", short(&from), body);

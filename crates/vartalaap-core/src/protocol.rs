@@ -48,6 +48,18 @@ pub enum SyncScope {
     Group(GroupId),
 }
 
+/// Lifecycle of an own message, as far as we can honestly know it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    /// Recorded locally; the peer was unreachable at send time.
+    Queued,
+    /// Written to a live connection without error.
+    Sent,
+    /// The peer confirmed holding it (their SyncHave contains the id, or
+    /// their read watermark reached its lamport).
+    Delivered,
+}
+
 /// The plaintext carried inside a ratchet-encrypted [`Wire::Message`].
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Payload {
