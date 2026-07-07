@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use futures_lite::StreamExt;
@@ -34,7 +34,7 @@ use vartalaap_net::{
 use vartalaap_sync::{Conversation, FileRef, Message, MessageKind};
 
 use crate::persist::Contact;
-pub use crate::protocol::{GroupId, GroupInfo, PeerKey, SyncScope};
+pub use crate::protocol::{DeliveryStatus, GroupId, GroupInfo, PeerKey, SyncScope};
 use crate::protocol::{Payload, PendingFile, Wire};
 use crate::Engine;
 
@@ -93,6 +93,12 @@ pub enum EngineEvent {
         scope: SyncScope,
         added: usize,
     },
+    /// One of our own messages changed delivery status.
+    MessageStatus {
+        peer: PeerKey,
+        id: vartalaap_sync::MessageId,
+        status: DeliveryStatus,
+    },
 }
 
 #[derive(Default)]
@@ -121,6 +127,15 @@ struct State {
     /// Peers for whom we deferred the post-connect send sequence because no
     /// session existed yet (we are the higher-id side; see `post_connect`).
     pending_post_connect: BTreeSet<PeerKey>,
+    /// Message ids each peer has confirmed holding, learned from their
+    /// SyncHave frames. Session-learned: repopulated fresh by every SyncHave,
+    /// not persisted.
+    peer_have: HashMap<PeerKey, BTreeSet<vartalaap_sync::MessageId>>,
+    /// Our own messages recorded while a peer had no live connection, not yet
+    /// confirmed delivered. Session-transient: the CRDT (`conversations`) is
+    /// the durable record; this is only "does the UI still owe a Queued
+    /// badge," so it does not need to survive a restart.
+    queued: HashMap<PeerKey, BTreeSet<vartalaap_sync::MessageId>>,
 }
 
 /// Shared connection-handling context: every free function that services a
@@ -272,6 +287,26 @@ impl Node {
                                 let is_new = ctx.state.lock().unwrap().discovered.insert(key);
                                 if is_new {
                                     let _ = ctx.events.send(EngineEvent::PeerDiscovered(key));
+                                    // Known contact with no live conn → dial so
+                                    // queued messages and history sync promptly.
+                                    let should_dial = {
+                                        let st = ctx.state.lock().unwrap();
+                                        st.contacts.contains_key(&key)
+                                            && !st.conns.contains_key(&key)
+                                    };
+                                    if should_dial {
+                                        let ctx2 = ctx.clone();
+                                        tokio::spawn(async move {
+                                            if let Ok(pid) = peer_id_from_bytes(key) {
+                                                if let Ok(conn) =
+                                                    ctx2.transport.connect_by_id(pid).await
+                                                {
+                                                    let _ =
+                                                        setup_connection(conn, ctx2.clone()).await;
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
                             }
                             PeerEvent::Expired(pid) => {
@@ -303,6 +338,16 @@ impl Node {
             .unwrap()
             .discovered
             .iter()
+            .copied()
+            .collect()
+    }
+
+    /// mDNS-visible peers that are NOT yet contacts (the "Nearby" list).
+    pub fn nearby(&self) -> Vec<PeerKey> {
+        let st = self.ctx.state.lock().unwrap();
+        st.discovered
+            .iter()
+            .filter(|p| !st.contacts.contains_key(*p))
             .copied()
             .collect()
     }
@@ -447,61 +492,92 @@ impl Node {
         Ok(())
     }
 
-    /// Send a text message to a connected peer, end-to-end encrypted.
-    pub async fn send_text(&self, peer: PeerKey, body: &str) -> Result<()> {
-        // Resolve the connection *before* mutating local history, so a send to a
-        // disconnected peer fails cleanly instead of leaving an undelivered
-        // message sitting in our replica looking as if it was sent.
-        let conn = {
-            let st = self.ctx.state.lock().unwrap();
-            st.conns.get(&peer).cloned()
-        }
-        .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
+    /// Send a text: deliver on a live connection when possible (one dial
+    /// attempt if needed), otherwise record locally as Queued — the message
+    /// heals over via delta sync on the next connect.
+    pub async fn send_text(&self, peer: PeerKey, body: &str) -> Result<(Message, DeliveryStatus)> {
+        let conn = self.live_or_dialed_conn(peer).await;
 
-        let now = now_millis();
         let message = {
             let mut st = self.ctx.state.lock().unwrap();
-            st.conversations
-                .entry(peer)
-                .or_default()
-                .create_text(self.id, now, body)
+            let m =
+                st.conversations
+                    .entry(peer)
+                    .or_default()
+                    .create_text(self.id, now_millis(), body);
+            if conn.is_none() {
+                st.queued.entry(peer).or_default().insert(m.id);
+            }
+            m
         };
         persist_convo(&self.ctx, &peer);
-        let plaintext = serde_json::to_vec(&Payload::Chat(message))?;
-        let ciphertext = encrypt_for(&self.ctx, peer, &plaintext)?;
 
-        let frame = serde_json::to_vec(&Wire::Message { ciphertext })?;
-        conn.send_frame(&frame).await?;
-        Ok(())
+        let status = match conn {
+            None => DeliveryStatus::Queued,
+            Some(conn) => {
+                let plaintext = serde_json::to_vec(&Payload::Chat(message.clone()))?;
+                match encrypt_for(&self.ctx, peer, &plaintext) {
+                    Ok(ciphertext) => {
+                        let frame = serde_json::to_vec(&Wire::Message { ciphertext })?;
+                        if conn.send_frame(&frame).await.is_ok() {
+                            DeliveryStatus::Sent
+                        } else {
+                            self.ctx
+                                .state
+                                .lock()
+                                .unwrap()
+                                .queued
+                                .entry(peer)
+                                .or_default()
+                                .insert(message.id);
+                            DeliveryStatus::Queued
+                        }
+                    }
+                    Err(_) => {
+                        self.ctx
+                            .state
+                            .lock()
+                            .unwrap()
+                            .queued
+                            .entry(peer)
+                            .or_default()
+                            .insert(message.id);
+                        DeliveryStatus::Queued
+                    }
+                }
+            }
+        };
+        let _ = self.ctx.events.send(EngineEvent::MessageStatus {
+            peer,
+            id: message.id,
+            status,
+        });
+        Ok((message, status))
     }
 
-    /// Record a text in the local replica without requiring a connection.
-    /// Delivery happens via delta sync on the next connect (Task 9 makes
-    /// send_text call this automatically when the peer is unreachable).
-    pub fn queue_local_text(&self, peer: PeerKey, body: &str) -> Result<Message> {
-        let now = now_millis();
-        let message = {
-            let mut st = self.ctx.state.lock().unwrap();
-            st.conversations
-                .entry(peer)
-                .or_default()
-                .create_text(self.id, now, body)
-        };
-        persist_convo(&self.ctx, &peer);
-        Ok(message)
+    /// The registered live connection, or the result of one bounded dial.
+    async fn live_or_dialed_conn(&self, peer: PeerKey) -> Option<Conn> {
+        if let Some(c) = self.ctx.state.lock().unwrap().conns.get(&peer).cloned() {
+            return Some(c);
+        }
+        let dial = tokio::time::timeout(Duration::from_secs(3), self.connect(peer)).await;
+        match dial {
+            Ok(Ok(())) => self.ctx.state.lock().unwrap().conns.get(&peer).cloned(),
+            _ => None,
+        }
     }
 
     /// Send a file to a connected peer, end-to-end encrypted. The offer (which
     /// carries the per-file key) travels through the ratchet; the bytes stream
     /// separately, sealed with that key.
     pub async fn send_file(&self, peer: PeerKey, path: &Path) -> Result<()> {
-        // Resolve the connection up front (see `send_text`): no point hashing a
-        // file or recording the offer locally if we can't deliver it.
-        let conn = {
-            let st = self.ctx.state.lock().unwrap();
-            st.conns.get(&peer).cloned()
-        }
-        .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
+        // Resolve the connection up front (see `send_text`), trying the same
+        // one-dial-attempt path — but file bytes can't queue, so still a hard
+        // error if no connection results.
+        let conn = self
+            .live_or_dialed_conn(peer)
+            .await
+            .ok_or_else(|| anyhow!("file transfers need a live peer"))?;
 
         let meta = prepare(path)?;
         let file_ref = FileRef {
@@ -585,6 +661,34 @@ impl Node {
         }
     }
 
+    /// Ordered messages plus, for own messages, the honest delivery status.
+    pub fn conversation_with_status(
+        &self,
+        peer: &PeerKey,
+    ) -> Vec<(Message, Option<DeliveryStatus>)> {
+        let st = self.ctx.state.lock().unwrap();
+        let Some(conv) = st.conversations.get(peer) else {
+            return Vec::new();
+        };
+        conv.messages_ordered()
+            .into_iter()
+            .map(|m| {
+                let status = if m.author == self.id {
+                    Some(if delivered(&st, peer, m) {
+                        DeliveryStatus::Delivered
+                    } else if st.queued.get(peer).is_some_and(|q| q.contains(&m.id)) {
+                        DeliveryStatus::Queued
+                    } else {
+                        DeliveryStatus::Sent
+                    })
+                } else {
+                    None
+                };
+                (m.clone(), status)
+            })
+            .collect()
+    }
+
     /// Encrypt a payload for `peer` and send it as a control frame.
     async fn send_payload(&self, peer: PeerKey, payload: &Payload) -> Result<()> {
         send_payload_ctx(&self.ctx, peer, payload).await
@@ -623,8 +727,15 @@ impl Node {
         Ok(id)
     }
 
-    /// Send a text message to every reachable member of a group (pairwise, E2E).
-    pub async fn send_group_text(&self, group: GroupId, body: &str) -> Result<()> {
+    /// Record a text in the group's CRDT and fan it out to every member we can
+    /// currently reach (pairwise, E2E). Unlike `send_text`, there is no dial
+    /// attempt per member here: the message is always recorded (queued for the
+    /// group, in effect), and members we can't reach right now simply miss the
+    /// live send — sync (`GroupAnnounce`/`SyncHave`/`SyncDelta`) heals them on
+    /// their next connect to any existing member. That's by design, not an
+    /// oversight: dialing every member on every send would not scale and the
+    /// CRDT already guarantees eventual convergence.
+    pub async fn send_group_text(&self, group: GroupId, body: &str) -> Result<Message> {
         let (members, message) = {
             let mut st = self.ctx.state.lock().unwrap();
             let info = st
@@ -654,7 +765,7 @@ impl Node {
                 )
                 .await;
         }
-        Ok(())
+        Ok(message)
     }
 
     /// Groups this node belongs to.
@@ -1138,6 +1249,9 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                     }
                 }
                 Payload::SyncHave { scope, ids } => {
+                    if matches!(scope, SyncScope::Direct) {
+                        absorb_peer_have(ctx, peer, &ids);
+                    }
                     if let Some(delta) = build_delta(ctx, peer, scope, &ids) {
                         let ctx2 = ctx.clone();
                         tokio::spawn(async move {
@@ -1173,6 +1287,37 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                 .mark_read(peer, up_to);
             persist_convo(ctx, &peer);
             let _ = ctx.events.send(EngineEvent::ReadReceipt { peer, up_to });
+
+            let newly_delivered: Vec<vartalaap_sync::MessageId> = {
+                let mut st = ctx.state.lock().unwrap();
+                let mine: Vec<_> = st
+                    .conversations
+                    .get(&peer)
+                    .map(|c| {
+                        c.messages_ordered()
+                            .into_iter()
+                            .filter(|m| m.author == ctx.my_id && m.lamport <= up_to)
+                            .map(|m| m.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let have = st.peer_have.entry(peer).or_default();
+                let fresh: Vec<_> = mine.into_iter().filter(|i| !have.contains(i)).collect();
+                have.extend(fresh.iter().copied());
+                if let Some(q) = st.queued.get_mut(&peer) {
+                    for i in &fresh {
+                        q.remove(i);
+                    }
+                }
+                fresh
+            };
+            for id in newly_delivered {
+                let _ = ctx.events.send(EngineEvent::MessageStatus {
+                    peer,
+                    id,
+                    status: DeliveryStatus::Delivered,
+                });
+            }
         }
     }
 }
@@ -1292,6 +1437,81 @@ fn apply_delta(
     let _ = ctx
         .events
         .send(EngineEvent::HistorySynced { peer, scope, added });
+
+    // A non-empty Direct-scope delta just changed OUR have-set. `their_ids`
+    // (which drove the delta we just applied) was THEIR have-set, so this
+    // exchange alone never tells the sender whether we now hold what they
+    // sent — the sender's own queued/own-message bookkeeping needs a fresh
+    // SyncHave from us to learn that (see `absorb_peer_have`). Bounded: the
+    // reply's own delta against our updated have-set is empty, so this does
+    // not loop.
+    if matches!(scope, SyncScope::Direct) && added > 0 {
+        let ids: Vec<vartalaap_sync::MessageId> = {
+            let st = ctx.state.lock().unwrap();
+            st.conversations
+                .get(&peer)
+                .map(|c| c.have().into_iter().collect())
+                .unwrap_or_default()
+        };
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move {
+            let _ = send_payload_ctx(
+                &ctx2,
+                peer,
+                &Payload::SyncHave {
+                    scope: SyncScope::Direct,
+                    ids,
+                },
+            )
+            .await;
+        });
+    }
+}
+
+/// Single source of truth for "has `peer` confirmed holding our message `m`":
+/// either their last SyncHave listed it, or their read watermark reached its
+/// lamport. Used by both the `MessageStatus` event emission and
+/// `conversation_with_status`.
+fn delivered(st: &State, peer: &PeerKey, m: &Message) -> bool {
+    st.peer_have.get(peer).is_some_and(|h| h.contains(&m.id))
+        || st
+            .conversations
+            .get(peer)
+            .is_some_and(|c| c.read_watermark(peer) >= m.lamport)
+}
+
+/// Learn what the peer holds; flip newly-covered own messages to Delivered.
+fn absorb_peer_have(ctx: &Arc<Ctx>, peer: PeerKey, ids: &[vartalaap_sync::MessageId]) {
+    let newly_delivered: Vec<vartalaap_sync::MessageId> = {
+        let mut st = ctx.state.lock().unwrap();
+        let have = st.peer_have.entry(peer).or_default();
+        let fresh: Vec<_> = ids.iter().filter(|i| !have.contains(*i)).copied().collect();
+        have.extend(ids.iter().copied());
+        if let Some(q) = st.queued.get_mut(&peer) {
+            for i in ids {
+                q.remove(i);
+            }
+        }
+        let mine: std::collections::BTreeSet<_> = st
+            .conversations
+            .get(&peer)
+            .map(|c| {
+                c.messages_ordered()
+                    .into_iter()
+                    .filter(|m| m.author == ctx.my_id)
+                    .map(|m| m.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        fresh.into_iter().filter(|i| mine.contains(i)).collect()
+    };
+    for id in newly_delivered {
+        let _ = ctx.events.send(EngineEvent::MessageStatus {
+            peer,
+            id,
+            status: DeliveryStatus::Delivered,
+        });
+    }
 }
 
 /// Receive a blob stream: wait for the matching offer, decrypt each chunk to a
@@ -1927,10 +2147,9 @@ mod tests {
             bid
         };
 
-        // Peer is gone: author a message into the local replica. This task
-        // introduces queue_local_text for exactly this; Task 9 folds it into
-        // send_text (and rewrites this line — see Task 9 step 3b).
-        alice.queue_local_text(bid, "while you were out")?;
+        // Peer is gone: send_text queues instead of erroring.
+        let (_m, s) = alice.send_text(bid, "while you were out").await?;
+        assert_eq!(s, DeliveryStatus::Queued);
 
         // Bob restarts with the same identity and reconnects.
         let (bob2, mut brx2) = Node::start(seed_b).await?;
@@ -2023,6 +2242,48 @@ mod tests {
         assert_eq!(carol2.groups().len(), 1);
         assert_eq!(carol2.group_conversation(&gid)[0].body, "carol missed this");
         let _ = aid;
+        Ok(())
+    }
+
+    /// send_text to an unreachable peer queues instead of erroring, and the
+    /// message transitions to Delivered once the peer syncs it down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_send_transitions_to_delivered() -> Result<()> {
+        let seed_b = [102u8; 32];
+        let (alice, mut arx) = Node::start([101u8; 32]).await?;
+        let bid = {
+            let (bob, _brx) = Node::start(seed_b).await?;
+            let bid = bob.id();
+            timeout(Duration::from_secs(20), alice.connect(bid))
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+            bob.shutdown().await;
+            wait_for(
+                &mut arx,
+                |e| matches!(e, EngineEvent::PeerDisconnected(p) if *p == bid),
+            )
+            .await;
+            bid
+        };
+
+        // Unreachable → queued, not an error.
+        let (msg, status) = alice.send_text(bid, "catch up later").await?;
+        assert_eq!(status, DeliveryStatus::Queued);
+        let statuses = alice.conversation_with_status(&bid);
+        assert_eq!(statuses.last().unwrap().1, Some(DeliveryStatus::Queued));
+
+        // Bob returns; alice reconnects; sync delivers; status flips.
+        let (bob2, _brx2) = Node::start(seed_b).await?;
+        timeout(Duration::from_secs(20), alice.connect(bid))
+            .await
+            .map_err(|_| anyhow!("reconnect timed out"))??;
+        wait_for(&mut arx, |e| {
+            matches!(e, EngineEvent::MessageStatus { id, status: DeliveryStatus::Delivered, .. } if *id == msg.id)
+        })
+        .await;
+        assert!(bob2
+            .conversation_bodies(&alice.id())
+            .contains(&"catch up later".to_string()));
         Ok(())
     }
 }
