@@ -13,6 +13,7 @@ use vartalaap_identity::{Identity, Profile, SignedProfile};
 use vartalaap_store::Store;
 
 pub mod node;
+pub mod persist;
 
 pub use vartalaap_sync::{FileRef, Message, MessageKind};
 
@@ -41,7 +42,7 @@ pub enum CoreError {
 
 pub struct Engine {
     identity: Identity,
-    store: Store,
+    pub(crate) store: Store,
 }
 
 impl Engine {
@@ -103,6 +104,12 @@ impl Engine {
         };
         let (_, profile) = signed.verify().map_err(|_| CoreError::CorruptProfile)?;
         Ok(Some(profile.clone()))
+    }
+
+    /// The stored signed profile, unverified-as-loaded (verification happens
+    /// in [`Engine::profile`]); used to publish over the wire.
+    pub fn signed_profile(&self) -> Result<Option<SignedProfile>, CoreError> {
+        Ok(self.store.get_json::<SignedProfile>(PROFILE_KEY)?)
     }
 }
 
