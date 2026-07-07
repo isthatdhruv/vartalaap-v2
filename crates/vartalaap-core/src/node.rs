@@ -352,6 +352,18 @@ impl Node {
             .collect()
     }
 
+    /// Peers with a live registered connection.
+    pub fn connected_peers(&self) -> Vec<PeerKey> {
+        self.ctx
+            .state
+            .lock()
+            .unwrap()
+            .conns
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Known contacts (persisted when the node is persistent).
     pub fn contacts(&self) -> Vec<Contact> {
         self.ctx
