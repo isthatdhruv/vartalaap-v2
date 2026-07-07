@@ -14,6 +14,7 @@ use vartalaap_store::Store;
 
 pub mod node;
 pub mod persist;
+pub mod protocol;
 
 pub use vartalaap_sync::{FileRef, Message, MessageKind};
 
