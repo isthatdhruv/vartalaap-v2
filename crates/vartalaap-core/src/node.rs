@@ -1003,57 +1003,62 @@ async fn wait_for_offer(
 /// Decrypt a received ciphertext into a [`Payload`]: continue an existing
 /// session, or accept a new inbound session from a pre-key (handshake) message.
 fn decrypt_payload(peer: PeerKey, ciphertext: &[u8], ctx: &Arc<Ctx>) -> Result<Payload> {
-    let has_session = ctx.state.lock().unwrap().sessions.contains_key(&peer);
-    let plaintext = if has_session {
-        let attempt = {
-            let mut st = ctx.state.lock().unwrap();
-            let session = st.sessions.get_mut(&peer).unwrap();
-            session.decrypt(ciphertext)
-        };
-        match attempt {
-            Ok(p) => p,
-            // The peer initiated a competing session (both sides sent first
-            // messages concurrently, or the peer restarted). We always try to
-            // recover this message via a fresh accept — otherwise its content
-            // is silently and permanently lost, which is exactly the bug this
-            // task fixes. Deterministic winner for which session survives
-            // going forward: the initiation from the lexicographically LOWER
-            // id. We adopt theirs as our stored session only if they are the
-            // lower side; otherwise we keep our own stored session (so both
-            // sides converge on exactly one survivor) but still deliver the
-            // content we just recovered. Any remainder heals via delta sync
-            // (Task 8).
-            Err(_) if vartalaap_crypto::ratchet::is_prekey(ciphertext) => {
-                let their_identity_key = {
-                    let st = ctx.state.lock().unwrap();
-                    st.bundles.get(&peer).map(|b| b.identity_key)
-                }
-                .ok_or_else(|| anyhow!("no bundle for peer; cannot accept session"))?;
-                let (session, plaintext) = {
-                    let mut acct = ctx.messaging.lock().unwrap();
-                    RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
-                };
-                if peer < ctx.my_id {
-                    ctx.state.lock().unwrap().sessions.insert(peer, session);
-                }
-                persist_msg_account(ctx);
-                plaintext
+    // Look up and use the session in ONE lock scope: sessions are evicted by
+    // reader_loop when a connection dies, so a separate "has session" check
+    // followed by a second lock + unwrap would race that eviction and panic
+    // while holding the state guard (poisoning the mutex node-wide). decrypt
+    // is synchronous, so no `.await` runs under the lock.
+    let attempt = {
+        let mut st = ctx.state.lock().unwrap();
+        st.sessions
+            .get_mut(&peer)
+            .map(|session| session.decrypt(ciphertext))
+    };
+    let plaintext = match attempt {
+        Some(Ok(p)) => p,
+        // The peer initiated a competing session (both sides sent first
+        // messages concurrently, or the peer restarted). We always try to
+        // recover this message via a fresh accept — otherwise its content
+        // is silently and permanently lost, which is exactly the bug this
+        // task fixes. Deterministic winner for which session survives
+        // going forward: the initiation from the lexicographically LOWER
+        // id. We adopt theirs as our stored session only if they are the
+        // lower side; otherwise we keep our own stored session (so both
+        // sides converge on exactly one survivor) but still deliver the
+        // content we just recovered. Any remainder heals via delta sync
+        // (Task 8).
+        Some(Err(_)) if vartalaap_crypto::ratchet::is_prekey(ciphertext) => {
+            let their_identity_key = {
+                let st = ctx.state.lock().unwrap();
+                st.bundles.get(&peer).map(|b| b.identity_key)
             }
-            Err(e) => return Err(e.into()),
+            .ok_or_else(|| anyhow!("no bundle for peer; cannot accept session"))?;
+            let (session, plaintext) = {
+                let mut acct = ctx.messaging.lock().unwrap();
+                RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
+            };
+            if peer < ctx.my_id {
+                ctx.state.lock().unwrap().sessions.insert(peer, session);
+            }
+            persist_msg_account(ctx);
+            plaintext
         }
-    } else {
-        let their_identity_key = {
-            let st = ctx.state.lock().unwrap();
-            st.bundles.get(&peer).map(|b| b.identity_key)
+        Some(Err(e)) => return Err(e.into()),
+        // No session yet: accept the inbound handshake unconditionally.
+        None => {
+            let their_identity_key = {
+                let st = ctx.state.lock().unwrap();
+                st.bundles.get(&peer).map(|b| b.identity_key)
+            }
+            .ok_or_else(|| anyhow!("no bundle for peer; cannot accept session"))?;
+            let (session, plaintext) = {
+                let mut acct = ctx.messaging.lock().unwrap();
+                RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
+            };
+            ctx.state.lock().unwrap().sessions.insert(peer, session);
+            persist_msg_account(ctx);
+            plaintext
         }
-        .ok_or_else(|| anyhow!("no bundle for peer; cannot accept session"))?;
-        let (session, plaintext) = {
-            let mut acct = ctx.messaging.lock().unwrap();
-            RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
-        };
-        ctx.state.lock().unwrap().sessions.insert(peer, session);
-        persist_msg_account(ctx);
-        plaintext
     };
     Ok(serde_json::from_slice(&plaintext)?)
 }
