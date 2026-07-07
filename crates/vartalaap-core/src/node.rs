@@ -19,7 +19,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use futures_lite::StreamExt;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use vartalaap_blobs::{prepare, DecryptSink, EncryptStream};
 use vartalaap_crypto::ratchet::{MessagingAccount, PreKeyBundle, RatchetSession};
@@ -29,10 +28,9 @@ use vartalaap_net::{
 };
 use vartalaap_sync::{Conversation, FileRef, Message, MessageKind};
 
+pub use crate::protocol::{GroupId, GroupInfo, PeerKey};
+use crate::protocol::{Payload, PendingFile, Wire};
 use crate::Engine;
-
-/// A peer's stable id: the 32-byte Vartalaap ID / Iroh PeerId.
-pub type PeerKey = [u8; 32];
 
 /// Events emitted by a [`Node`] for the UI / caller to observe.
 #[derive(Debug, Clone)]
@@ -71,58 +69,6 @@ pub enum EngineEvent {
     GroupInvited(GroupId),
     /// A message arrived in a group.
     GroupMessageReceived { group: GroupId, message: Message },
-}
-
-/// Frames exchanged on the wire (JSON-encoded).
-///
-/// `Hello`/`Message` are the durable protocol; the rest are ephemeral gossip
-/// (not persisted to the CRDT), carried inside the already-encrypted transport.
-#[derive(Serialize, Deserialize)]
-enum Wire {
-    /// Sent once per connection: the sender's pre-key bundle.
-    Hello { bundle: PreKeyBundle },
-    /// A ratchet-encrypted [`Message`] payload.
-    Message { ciphertext: Vec<u8> },
-    /// The sender is typing (ephemeral).
-    Typing,
-    /// The sender's presence (ephemeral).
-    Presence { online: bool },
-    /// The sender has read up to this lamport watermark (ephemeral).
-    Read { up_to: u64 },
-}
-
-/// A group's stable identifier.
-pub type GroupId = [u8; 16];
-
-/// Metadata describing a group conversation.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GroupInfo {
-    pub id: GroupId,
-    pub name: String,
-    /// All members, including the creator (sorted, deduplicated).
-    pub members: Vec<PeerKey>,
-    pub creator: PeerKey,
-}
-
-/// The plaintext carried inside a ratchet-encrypted [`Wire::Message`].
-#[derive(Serialize, Deserialize)]
-enum Payload {
-    /// A 1:1 chat message (text or a file reference).
-    Chat(Message),
-    /// A file offer: the chat message plus the secret key for the upcoming blob
-    /// stream. The key travels end-to-end and never touches the persisted CRDT.
-    FileOffer { message: Message, key: [u8; 32] },
-    /// An invitation announcing a group and its membership.
-    GroupInvite(GroupInfo),
-    /// A message addressed to a group (fanned out pairwise to each member).
-    GroupMessage { group: GroupId, message: Message },
-}
-
-/// A file we've been offered and expect a blob stream for.
-struct PendingFile {
-    key: [u8; 32],
-    sha256: [u8; 32],
-    name: String,
 }
 
 #[derive(Default)]
