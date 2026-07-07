@@ -33,6 +33,7 @@ use vartalaap_net::{
 };
 use vartalaap_sync::{Conversation, FileRef, Message, MessageKind};
 
+use crate::persist::Contact;
 pub use crate::protocol::{GroupId, GroupInfo, PeerKey};
 use crate::protocol::{Payload, PendingFile, Wire};
 use crate::Engine;
@@ -74,6 +75,9 @@ pub enum EngineEvent {
     GroupInvited(GroupId),
     /// A message arrived in a group.
     GroupMessageReceived { group: GroupId, message: Message },
+    /// A vault read/write problem the user should know about (load quarantine
+    /// or write failure). The app keeps running on in-memory state.
+    StorageWarning { detail: String },
 }
 
 #[derive(Default)]
@@ -89,8 +93,6 @@ struct State {
     conn_gen: HashMap<PeerKey, u64>,
     /// Monotonic source for `conn_gen`.
     next_gen: u64,
-    /// Trust-on-first-use: the key we pinned for each peer.
-    pinned: HashMap<PeerKey, PeerKey>,
     /// Peers currently visible on the LAN via mDNS.
     discovered: BTreeSet<PeerKey>,
     /// File transfers offered but not yet received, keyed by transfer id.
@@ -99,6 +101,8 @@ struct State {
     groups: HashMap<GroupId, GroupInfo>,
     /// Per-group message history (CRDT), keyed by group id.
     group_convos: HashMap<GroupId, Conversation>,
+    /// Known contacts: peers we've completed at least one handshake with.
+    contacts: HashMap<PeerKey, Contact>,
 }
 
 /// Shared connection-handling context: every free function that services a
@@ -163,8 +167,42 @@ impl Node {
             Some(engine) => engine.load_or_create_msg_account()?,
             None => MessagingAccount::new(),
         }));
-        let state = Arc::new(Mutex::new(State::default()));
         let (tx, rx) = mpsc::unbounded_channel();
+
+        // Load the persisted roster/history before any connection can mutate
+        // it, so a peer that reconnects immediately sees continuity.
+        let mut initial = State::default();
+        if let Some(engine) = &engine {
+            let mut warn_all = Vec::new();
+            let (contacts, w) = engine.load_contacts()?;
+            warn_all.extend(w);
+            for c in contacts {
+                initial.contacts.insert(c.peer, c);
+            }
+            let (convos, w) = engine.load_convos()?;
+            warn_all.extend(w);
+            for (peer, snap) in convos {
+                initial
+                    .conversations
+                    .insert(peer, Conversation::from_snapshot(snap));
+            }
+            let (groups, w) = engine.load_groups()?;
+            warn_all.extend(w);
+            for g in groups {
+                initial.groups.insert(g.id, g);
+            }
+            let (gconvos, w) = engine.load_group_convos()?;
+            warn_all.extend(w);
+            for (gid, snap) in gconvos {
+                initial
+                    .group_convos
+                    .insert(gid, Conversation::from_snapshot(snap));
+            }
+            for detail in warn_all {
+                let _ = tx.send(EngineEvent::StorageWarning { detail });
+            }
+        }
+        let state = Arc::new(Mutex::new(initial));
 
         let ctx = Arc::new(Ctx {
             my_id: id,
@@ -190,12 +228,23 @@ impl Node {
             });
         }
 
-        // Discovery loop: surface peers appearing/leaving on the LAN.
+        // Discovery loop: surface peers appearing/leaving on the LAN. Raced
+        // against `transport.closed()` so `shutdown()` actually drains this
+        // task — the mDNS subscription stream otherwise never ends on its own
+        // (its actor stays alive as long as this task holds `ctx.transport`),
+        // which would leak this node's `Ctx` (and its vault handle) forever.
         {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 if let Some(mut stream) = ctx.transport.peer_events().await {
-                    while let Some(ev) = stream.next().await {
+                    let closed = ctx.transport.closed();
+                    tokio::pin!(closed);
+                    loop {
+                        let ev = tokio::select! {
+                            ev = stream.next() => ev,
+                            _ = &mut closed => break,
+                        };
+                        let Some(ev) = ev else { break };
                         match ev {
                             PeerEvent::Discovered(pid) => {
                                 let key = peer_id_bytes(&pid);
@@ -237,6 +286,18 @@ impl Node {
             .discovered
             .iter()
             .copied()
+            .collect()
+    }
+
+    /// Known contacts (persisted when the node is persistent).
+    pub fn contacts(&self) -> Vec<Contact> {
+        self.ctx
+            .state
+            .lock()
+            .unwrap()
+            .contacts
+            .values()
+            .cloned()
             .collect()
     }
 
@@ -324,6 +385,7 @@ impl Node {
                 .or_default()
                 .create_text(self.id, now, body)
         };
+        persist_convo(&self.ctx, &peer);
         let plaintext = serde_json::to_vec(&Payload::Chat(message))?;
         let ciphertext = self.encrypt_for(peer, &plaintext)?;
 
@@ -359,6 +421,7 @@ impl Node {
                 .or_default()
                 .create_file(self.id, now_millis(), file_ref)
         };
+        persist_convo(&self.ctx, &peer);
         let payload = serde_json::to_vec(&Payload::FileOffer {
             message,
             key: meta.key,
@@ -448,6 +511,7 @@ impl Node {
                 .or_default()
                 .mark_read(self.id, up_to);
         }
+        persist_convo(&self.ctx, &peer);
         self.send_to(peer, &Wire::Read { up_to }).await
     }
 
@@ -497,6 +561,8 @@ impl Node {
             st.groups.insert(id, info.clone());
             st.group_convos.entry(id).or_default();
         }
+        persist_group(&self.ctx, &id);
+        persist_group_convo(&self.ctx, &id);
         for m in all {
             if m == self.id {
                 continue;
@@ -524,6 +590,7 @@ impl Node {
                     .create_text(self.id, now_millis(), body);
             (info.members, message)
         };
+        persist_group_convo(&self.ctx, &group);
         for m in members {
             if m == self.id {
                 continue;
@@ -569,6 +636,72 @@ impl Node {
         let path = blob_dest(&self.ctx.download_dir, &transfer_id, name);
         path.exists().then(|| path.to_string_lossy().into_owned())
     }
+
+    /// Close the endpoint so the accept loop ends and background tasks drain.
+    pub async fn shutdown(&self) {
+        self.ctx.transport.close().await;
+    }
+}
+
+/// Snapshot under the lock, write outside it. Failures warn, never crash.
+fn persist_convo(ctx: &Ctx, peer: &PeerKey) {
+    let Some(engine) = &ctx.engine else { return };
+    let snap = {
+        let st = ctx.state.lock().unwrap();
+        st.conversations.get(peer).map(|c| c.snapshot())
+    };
+    if let Some(snap) = snap {
+        if let Err(e) = engine.save_convo(peer, &snap) {
+            let _ = ctx.events.send(EngineEvent::StorageWarning {
+                detail: format!("failed to persist conversation: {e}"),
+            });
+        }
+    }
+}
+
+fn persist_group_convo(ctx: &Ctx, gid: &GroupId) {
+    let Some(engine) = &ctx.engine else { return };
+    let snap = {
+        let st = ctx.state.lock().unwrap();
+        st.group_convos.get(gid).map(|c| c.snapshot())
+    };
+    if let Some(snap) = snap {
+        if let Err(e) = engine.save_group_convo(gid, &snap) {
+            let _ = ctx.events.send(EngineEvent::StorageWarning {
+                detail: format!("failed to persist group conversation: {e}"),
+            });
+        }
+    }
+}
+
+fn persist_group(ctx: &Ctx, gid: &GroupId) {
+    let Some(engine) = &ctx.engine else { return };
+    let info = {
+        let st = ctx.state.lock().unwrap();
+        st.groups.get(gid).cloned()
+    };
+    if let Some(info) = info {
+        if let Err(e) = engine.save_group(&info) {
+            let _ = ctx.events.send(EngineEvent::StorageWarning {
+                detail: format!("failed to persist group: {e}"),
+            });
+        }
+    }
+}
+
+fn persist_contact(ctx: &Ctx, peer: &PeerKey) {
+    let Some(engine) = &ctx.engine else { return };
+    let contact = {
+        let st = ctx.state.lock().unwrap();
+        st.contacts.get(peer).cloned()
+    };
+    if let Some(contact) = contact {
+        if let Err(e) = engine.save_contact(&contact) {
+            let _ = ctx.events.send(EngineEvent::StorageWarning {
+                detail: format!("failed to persist contact: {e}"),
+            });
+        }
+    }
 }
 
 /// Perform the Hello handshake on a freshly-opened connection, then spawn a
@@ -592,18 +725,31 @@ async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
             Err(_) => continue, // skip malformed frames
         }
     };
-    let generation = {
+    let now = now_millis();
+    let (generation, is_new_contact) = {
         let mut st = ctx.state.lock().unwrap();
         st.bundles.insert(peer, bundle);
-        // Trust-on-first-use: pin this id the first time we see it.
-        st.pinned.entry(peer).or_insert(peer);
         st.conns.insert(peer, conn.clone());
         let generation = st.next_gen;
         st.next_gen += 1;
         st.conn_gen.insert(peer, generation);
         st.conversations.entry(peer).or_default();
-        generation
+        // Trust-on-first-use: upsert the roster entry for this peer.
+        let is_new = !st.contacts.contains_key(&peer);
+        let entry = st.contacts.entry(peer).or_insert_with(|| Contact {
+            peer,
+            profile: None,
+            alias: None,
+            pinned_msg_key: None, // pinned in Task 7
+            pending_msg_key: None,
+            last_seen: now,
+            added_at: now,
+        });
+        entry.last_seen = now;
+        (generation, is_new)
     };
+    persist_contact(&ctx, &peer);
+    let _ = is_new_contact; // used by Task 7's ContactUpdated event
     let _ = ctx.events.send(EngineEvent::PeerConnected(peer));
 
     // Service the rest of the connection in the background.
@@ -642,12 +788,16 @@ async fn reader_loop(conn: Conn, peer: PeerKey, generation: u64, ctx: Arc<Ctx>) 
         if st.conn_gen.get(&peer).copied() == Some(generation) {
             st.conns.remove(&peer);
             st.conn_gen.remove(&peer);
+            if let Some(c) = st.contacts.get_mut(&peer) {
+                c.last_seen = now_millis();
+            }
             true
         } else {
             false
         }
     };
     if was_current {
+        persist_contact(&ctx, &peer);
         let _ = ctx.events.send(EngineEvent::PeerDisconnected(peer));
     }
 }
@@ -684,6 +834,8 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                         st.groups.entry(id).or_insert(info);
                         st.group_convos.entry(id).or_default();
                     }
+                    persist_group(ctx, &id);
+                    persist_group_convo(ctx, &id);
                     let _ = ctx.events.send(EngineEvent::GroupInvited(id));
                 }
                 Payload::GroupMessage { group, message } => {
@@ -694,6 +846,7 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                         .entry(group)
                         .or_default()
                         .apply(message.clone());
+                    persist_group_convo(ctx, &group);
                     let _ = ctx
                         .events
                         .send(EngineEvent::GroupMessageReceived { group, message });
@@ -716,6 +869,7 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                 .entry(peer)
                 .or_default()
                 .mark_read(peer, up_to);
+            persist_convo(ctx, &peer);
             let _ = ctx.events.send(EngineEvent::ReadReceipt { peer, up_to });
         }
     }
@@ -723,13 +877,18 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
 
 /// Apply a 1:1 message to the per-peer conversation and notify listeners.
 fn apply_direct_message(peer: PeerKey, message: Message, ctx: &Arc<Ctx>) {
-    ctx.state
-        .lock()
-        .unwrap()
-        .conversations
-        .entry(peer)
-        .or_default()
-        .apply(message.clone());
+    {
+        let mut st = ctx.state.lock().unwrap();
+        st.conversations
+            .entry(peer)
+            .or_default()
+            .apply(message.clone());
+        if let Some(c) = st.contacts.get_mut(&peer) {
+            c.last_seen = now_millis();
+        }
+    }
+    persist_convo(ctx, &peer);
+    persist_contact(ctx, &peer);
     let _ = ctx
         .events
         .send(EngineEvent::MessageReceived { peer, message });
@@ -1105,6 +1264,50 @@ mod tests {
         assert_eq!(bob.group_conversation(&gid).len(), 2);
         assert_eq!(carol.group_conversation(&gid).len(), 2);
         let _ = aid;
+        Ok(())
+    }
+
+    /// Persistence: messages, groups, and contacts survive an app restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn state_survives_restart() -> Result<()> {
+        let dir = {
+            let mut p = std::env::temp_dir();
+            let n: u64 = rand::random();
+            p.push(format!("vartalaap-restart-{n}"));
+            p
+        };
+        let (bob, mut bob_rx) = Node::start([61u8; 32]).await?;
+        let bob_id = bob.id();
+
+        let gid;
+        {
+            let (alice, mut alice_rx) = Node::start_persistent(&dir, "pw").await?;
+            timeout(Duration::from_secs(20), alice.connect(bob_id))
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+            alice.send_text(bob_id, "remember me").await?;
+            wait_message(&mut bob_rx).await;
+            bob.send_text(alice.id(), "and me").await?;
+            wait_message(&mut alice_rx).await;
+            gid = alice.create_group("study".into(), vec![bob_id]).await?;
+            alice.send_group_text(gid, "group msg").await?;
+            alice.shutdown().await;
+        }
+
+        // Restart from the same directory: everything must reload, offline.
+        let (alice2, _rx) = Node::start_persistent(&dir, "pw").await?;
+        let bodies = alice2.conversation_bodies(&bob_id);
+        assert!(bodies.contains(&"remember me".to_string()));
+        assert!(bodies.contains(&"and me".to_string()));
+        let groups = alice2.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "study");
+        assert_eq!(alice2.group_conversation(&gid).len(), 1);
+        let contacts = alice2.contacts();
+        assert_eq!(contacts.len(), 1, "bob must be a persisted contact");
+        assert_eq!(contacts[0].peer, bob_id);
+        alice2.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }
