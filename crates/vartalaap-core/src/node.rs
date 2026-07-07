@@ -1247,13 +1247,23 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                     }
                 }
                 Payload::GroupMessage { group, message } => {
-                    ctx.state
-                        .lock()
-                        .unwrap()
-                        .group_convos
-                        .entry(group)
-                        .or_default()
-                        .apply(message.clone());
+                    // Membership gate: a handshaked peer is not automatically
+                    // a group member. Without this check, any connected peer
+                    // could inject into a group it was never invited to (or
+                    // fabricate a random, never-created GroupId), silently
+                    // creating an unbounded number of phantom `gconvo/` vault
+                    // blobs. Drop the frame unless we recognize the group and
+                    // both ends are members of it.
+                    {
+                        let mut st = ctx.state.lock().unwrap();
+                        if !group_allows(&st, &group, &peer, &ctx.my_id) {
+                            return;
+                        }
+                        st.group_convos
+                            .entry(group)
+                            .or_default()
+                            .apply(message.clone());
+                    }
                     persist_group_convo(ctx, &group);
                     let _ = ctx
                         .events
@@ -1432,6 +1442,19 @@ fn offer_group_sync(ctx: &Arc<Ctx>, peer: PeerKey, gid: GroupId) {
     });
 }
 
+/// Membership gate for anything group-scoped: true only if `gid` names a
+/// group we know about and both `peer` and `me` are members of it. Shared by
+/// the inbound `Payload::GroupMessage` handler and the `build_delta` /
+/// `apply_delta` sync paths, so a peer we've merely handshaked with (but
+/// never invited to this group) can neither inject into nor read a group's
+/// history — it isn't enough to know the random `GroupId`.
+fn group_allows(st: &State, gid: &GroupId, peer: &PeerKey, me: &PeerKey) -> bool {
+    match st.groups.get(gid) {
+        Some(g) => g.members.contains(peer) && g.members.contains(me),
+        None => false,
+    }
+}
+
 /// Answer a peer's have-list with everything they're missing in `scope`.
 /// Returns None only when the scope is invalid (unknown/forbidden group).
 fn build_delta(
@@ -1445,9 +1468,8 @@ fn build_delta(
     let convo = match scope {
         SyncScope::Direct => st.conversations.get(&peer),
         SyncScope::Group(gid) => {
-            let g = st.groups.get(&gid)?;
             // Membership gate: never leak a group convo to a non-member.
-            if !g.members.contains(&peer) || !g.members.contains(&ctx.my_id) {
+            if !group_allows(&st, &gid, &peer, &ctx.my_id) {
                 return None;
             }
             st.group_convos.get(&gid)
@@ -1476,10 +1498,7 @@ fn apply_delta(
         let convo = match scope {
             SyncScope::Direct => st.conversations.entry(peer).or_default(),
             SyncScope::Group(gid) => {
-                let Some(g) = st.groups.get(&gid) else {
-                    return;
-                };
-                if !g.members.contains(&peer) || !g.members.contains(&ctx.my_id) {
+                if !group_allows(&st, &gid, &peer, &ctx.my_id) {
                     return;
                 }
                 st.group_convos.entry(gid).or_default()
@@ -2382,5 +2401,42 @@ mod tests {
             .conversation_bodies(&alice.id())
             .contains(&"catch up later".to_string()));
         Ok(())
+    }
+
+    /// `group_allows` is the single membership gate shared by the inbound
+    /// `Payload::GroupMessage` handler and the `build_delta`/`apply_delta`
+    /// sync paths, so a peer we've merely handshaked with (but never
+    /// invited to a group, or that fabricates a random `GroupId`) cannot
+    /// inject into or read a group's history. Exercised directly at the
+    /// unit level: driving it through the real protocol would require
+    /// constructing a hostile `Payload` by hand for no added determinism
+    /// (the 3 call sites that use it are reviewed by eye instead).
+    #[test]
+    fn group_allows_gates_on_known_group_and_mutual_membership() {
+        let gid: GroupId = [1u8; 16];
+        let unknown_gid: GroupId = [2u8; 16];
+        let me: PeerKey = [0xAA; 32];
+        let member: PeerKey = [0xBB; 32];
+        let stranger: PeerKey = [0xCC; 32];
+
+        let mut st = State::default();
+        st.groups.insert(
+            gid,
+            GroupInfo {
+                id: gid,
+                name: "study".into(),
+                members: vec![me, member],
+                creator: me,
+            },
+        );
+
+        // Known group, both peer and me are members.
+        assert!(group_allows(&st, &gid, &member, &me));
+        // Unknown group id (e.g. a fabricated GroupId nobody ever created).
+        assert!(!group_allows(&st, &unknown_gid, &member, &me));
+        // Known group, but the sending peer is not a member.
+        assert!(!group_allows(&st, &gid, &stranger, &me));
+        // Known group, peer is a member, but *we* are not.
+        assert!(!group_allows(&st, &gid, &member, &stranger));
     }
 }
