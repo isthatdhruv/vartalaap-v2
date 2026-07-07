@@ -11,6 +11,11 @@
 //! Locking discipline: the `state` and `messaging` mutexes are never held across
 //! an `.await`, and never both held at once, so there is no deadlock or blocked
 //! reactor.
+//!
+//! Connection-handling free functions (`setup_connection`, `reader_loop`,
+//! `handle_frame`, ...) all take a shared [`Ctx`] instead of individual field
+//! clones, so new cross-cutting state (e.g. persistence) is threaded through
+//! in one place.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -96,21 +101,30 @@ struct State {
     group_convos: HashMap<GroupId, Conversation>,
 }
 
-/// A running Vartalaap node.
-pub struct Node {
-    id: PeerKey,
-    messaging: Arc<Mutex<MessagingAccount>>,
+/// Shared connection-handling context: every free function that services a
+/// connection takes a `ctx: Arc<Ctx>` (or `&Arc<Ctx>`/`&Ctx`) instead of a
+/// fistful of individually-cloned fields, so new cross-cutting state (e.g. a
+/// persistence handle) is added in one place instead of every signature.
+pub(crate) struct Ctx {
+    my_id: PeerKey,
     transport: Arc<IrohTransport>,
+    messaging: Arc<Mutex<MessagingAccount>>,
     state: Arc<Mutex<State>>,
     events: mpsc::UnboundedSender<EngineEvent>,
     /// Serializes outbound ratchet-session *creation* so two concurrent
     /// first-sends to the same peer cannot each initiate a distinct session
     /// (the peer would accept only one and silently drop the other's messages).
-    session_init: Mutex<()>,
+    session_init: Arc<Mutex<()>>,
     /// Where received files are written.
     download_dir: PathBuf,
     /// Present when started with persistence; owns identity/profile/store.
     engine: Option<Arc<Engine>>,
+}
+
+/// A running Vartalaap node.
+pub struct Node {
+    id: PeerKey,
+    ctx: Arc<Ctx>,
 }
 
 impl Node {
@@ -145,26 +159,32 @@ impl Node {
     ) -> Result<(Self, mpsc::UnboundedReceiver<EngineEvent>)> {
         let id = Identity::from_secret_bytes(seed).public_id().to_bytes();
         let transport = Arc::new(IrohTransport::bind_with_discovery(seed).await?);
-        let messaging = Arc::new(Mutex::new(MessagingAccount::new()));
+        let messaging = Arc::new(Mutex::new(match &engine {
+            Some(engine) => engine.load_or_create_msg_account()?,
+            None => MessagingAccount::new(),
+        }));
         let state = Arc::new(Mutex::new(State::default()));
         let (tx, rx) = mpsc::unbounded_channel();
 
+        let ctx = Arc::new(Ctx {
+            my_id: id,
+            transport,
+            messaging,
+            state,
+            events: tx.clone(),
+            session_init: Arc::new(Mutex::new(())),
+            download_dir,
+            engine,
+        });
+
         // Accept loop: each incoming connection gets handshaked and serviced.
         {
-            let transport = transport.clone();
-            let messaging = messaging.clone();
-            let state = state.clone();
-            let events = tx.clone();
-            let download_dir = download_dir.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                while let Ok(Some(conn)) = transport.accept().await {
-                    let messaging = messaging.clone();
-                    let state = state.clone();
-                    let events = events.clone();
-                    let download_dir = download_dir.clone();
+                while let Ok(Some(conn)) = ctx.transport.accept().await {
+                    let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        let _ = setup_connection(conn, id, messaging, state, events, download_dir)
-                            .await;
+                        let _ = setup_connection(conn, ctx).await;
                     });
                 }
             });
@@ -172,25 +192,23 @@ impl Node {
 
         // Discovery loop: surface peers appearing/leaving on the LAN.
         {
-            let transport = transport.clone();
-            let state = state.clone();
-            let events = tx.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                if let Some(mut stream) = transport.peer_events().await {
+                if let Some(mut stream) = ctx.transport.peer_events().await {
                     while let Some(ev) = stream.next().await {
                         match ev {
                             PeerEvent::Discovered(pid) => {
                                 let key = peer_id_bytes(&pid);
-                                if key == id {
+                                if key == ctx.my_id {
                                     continue; // ignore ourselves
                                 }
-                                let is_new = state.lock().unwrap().discovered.insert(key);
+                                let is_new = ctx.state.lock().unwrap().discovered.insert(key);
                                 if is_new {
-                                    let _ = events.send(EngineEvent::PeerDiscovered(key));
+                                    let _ = ctx.events.send(EngineEvent::PeerDiscovered(key));
                                 }
                             }
                             PeerEvent::Expired(pid) => {
-                                state
+                                ctx.state
                                     .lock()
                                     .unwrap()
                                     .discovered
@@ -202,19 +220,7 @@ impl Node {
             });
         }
 
-        Ok((
-            Node {
-                id,
-                messaging,
-                transport,
-                state,
-                events: tx,
-                session_init: Mutex::new(()),
-                download_dir,
-                engine,
-            },
-            rx,
-        ))
+        Ok((Node { id, ctx }, rx))
     }
 
     /// This node's Vartalaap ID.
@@ -224,7 +230,8 @@ impl Node {
 
     /// Peers currently visible on the LAN.
     pub fn discovered_peers(&self) -> Vec<PeerKey> {
-        self.state
+        self.ctx
+            .state
             .lock()
             .unwrap()
             .discovered
@@ -235,7 +242,7 @@ impl Node {
 
     /// A snapshot of the full ordered messages in the conversation with `peer`.
     pub fn conversation(&self, peer: &PeerKey) -> Vec<Message> {
-        let st = self.state.lock().unwrap();
+        let st = self.ctx.state.lock().unwrap();
         match st.conversations.get(peer) {
             None => Vec::new(),
             Some(conv) => conv.messages_ordered().into_iter().cloned().collect(),
@@ -244,12 +251,12 @@ impl Node {
 
     /// The human-facing Vartalaap ID fingerprint, if persistence is enabled.
     pub fn fingerprint(&self) -> Option<String> {
-        self.engine.as_ref().map(|e| e.vartalaap_id())
+        self.ctx.engine.as_ref().map(|e| e.vartalaap_id())
     }
 
     /// The stored profile, if persistence is enabled and one is set.
     pub fn profile(&self) -> Result<Option<Profile>> {
-        match &self.engine {
+        match &self.ctx.engine {
             Some(e) => Ok(e.profile()?),
             None => Ok(None),
         }
@@ -257,7 +264,7 @@ impl Node {
 
     /// Persist a new profile (requires persistence).
     pub fn set_profile(&self, profile: Profile) -> Result<()> {
-        match &self.engine {
+        match &self.ctx.engine {
             Some(e) => {
                 e.set_profile(profile)?;
                 Ok(())
@@ -293,16 +300,8 @@ impl Node {
     /// address over LAN discovery.
     pub async fn connect(&self, peer: PeerKey) -> Result<()> {
         let peer_id = peer_id_from_bytes(peer)?;
-        let conn = self.transport.connect_by_id(peer_id).await?;
-        setup_connection(
-            conn,
-            self.id,
-            self.messaging.clone(),
-            self.state.clone(),
-            self.events.clone(),
-            self.download_dir.clone(),
-        )
-        .await?;
+        let conn = self.ctx.transport.connect_by_id(peer_id).await?;
+        setup_connection(conn, self.ctx.clone()).await?;
         Ok(())
     }
 
@@ -312,14 +311,14 @@ impl Node {
         // disconnected peer fails cleanly instead of leaving an undelivered
         // message sitting in our replica looking as if it was sent.
         let conn = {
-            let st = self.state.lock().unwrap();
+            let st = self.ctx.state.lock().unwrap();
             st.conns.get(&peer).cloned()
         }
         .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
 
         let now = now_millis();
         let message = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             st.conversations
                 .entry(peer)
                 .or_default()
@@ -340,7 +339,7 @@ impl Node {
         // Resolve the connection up front (see `send_text`): no point hashing a
         // file or recording the offer locally if we can't deliver it.
         let conn = {
-            let st = self.state.lock().unwrap();
+            let st = self.ctx.state.lock().unwrap();
             st.conns.get(&peer).cloned()
         }
         .ok_or_else(|| anyhow!("no connection to peer; call connect() first"))?;
@@ -354,7 +353,7 @@ impl Node {
             sha256: meta.sha256,
         };
         let message = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             st.conversations
                 .entry(peer)
                 .or_default()
@@ -384,7 +383,7 @@ impl Node {
     fn encrypt_for(&self, peer: PeerKey, plaintext: &[u8]) -> Result<Vec<u8>> {
         // Fast path: an established session already exists.
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             if let Some(session) = st.sessions.get_mut(&peer) {
                 return Ok(session.encrypt(plaintext)?);
             }
@@ -394,30 +393,35 @@ impl Node {
         // the loser re-observes the session the winner installed instead of
         // initiating a *second* session the peer would never accept. (This
         // method is fully synchronous, so no `.await` is held under the lock.)
-        let _init = self.session_init.lock().unwrap();
+        let _init = self.ctx.session_init.lock().unwrap();
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             if let Some(session) = st.sessions.get_mut(&peer) {
                 return Ok(session.encrypt(plaintext)?);
             }
         }
         let bundle = {
-            let st = self.state.lock().unwrap();
+            let st = self.ctx.state.lock().unwrap();
             st.bundles.get(&peer).copied()
         }
         .ok_or_else(|| anyhow!("no pre-key bundle for peer; handshake incomplete"))?;
         let (session, ciphertext) = {
-            let acct = self.messaging.lock().unwrap();
+            let acct = self.ctx.messaging.lock().unwrap();
             RatchetSession::initiate(&acct, &bundle, plaintext)?
         };
-        self.state.lock().unwrap().sessions.insert(peer, session);
+        self.ctx
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(peer, session);
         Ok(ciphertext)
     }
 
     /// Send a frame to a connected peer.
     async fn send_to(&self, peer: PeerKey, wire: &Wire) -> Result<()> {
         let conn = {
-            let st = self.state.lock().unwrap();
+            let st = self.ctx.state.lock().unwrap();
             st.conns.get(&peer).cloned()
         }
         .ok_or_else(|| anyhow!("no connection to peer"))?;
@@ -438,7 +442,7 @@ impl Node {
     /// Record locally that we've read up to `up_to`, and tell the peer.
     pub async fn mark_read(&self, peer: PeerKey, up_to: u64) -> Result<()> {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             st.conversations
                 .entry(peer)
                 .or_default()
@@ -449,7 +453,7 @@ impl Node {
 
     /// A snapshot of the messages in the conversation with `peer`, ordered.
     pub fn conversation_bodies(&self, peer: &PeerKey) -> Vec<String> {
-        let st = self.state.lock().unwrap();
+        let st = self.ctx.state.lock().unwrap();
         match st.conversations.get(peer) {
             None => Vec::new(),
             Some(conv) => conv
@@ -464,7 +468,7 @@ impl Node {
     async fn send_payload(&self, peer: PeerKey, payload: &Payload) -> Result<()> {
         let ciphertext = self.encrypt_for(peer, &serde_json::to_vec(payload)?)?;
         let conn = {
-            let st = self.state.lock().unwrap();
+            let st = self.ctx.state.lock().unwrap();
             st.conns.get(&peer).cloned()
         }
         .ok_or_else(|| anyhow!("no connection to peer"))?;
@@ -489,7 +493,7 @@ impl Node {
             creator: self.id,
         };
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             st.groups.insert(id, info.clone());
             st.group_convos.entry(id).or_default();
         }
@@ -507,7 +511,7 @@ impl Node {
     /// Send a text message to every reachable member of a group (pairwise, E2E).
     pub async fn send_group_text(&self, group: GroupId, body: &str) -> Result<()> {
         let (members, message) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.ctx.state.lock().unwrap();
             let info = st
                 .groups
                 .get(&group)
@@ -539,7 +543,8 @@ impl Node {
 
     /// Groups this node belongs to.
     pub fn groups(&self) -> Vec<GroupInfo> {
-        self.state
+        self.ctx
+            .state
             .lock()
             .unwrap()
             .groups
@@ -550,7 +555,7 @@ impl Node {
 
     /// Ordered messages in a group's conversation.
     pub fn group_conversation(&self, group: &GroupId) -> Vec<Message> {
-        let st = self.state.lock().unwrap();
+        let st = self.ctx.state.lock().unwrap();
         match st.group_convos.get(group) {
             None => Vec::new(),
             Some(conv) => conv.messages_ordered().into_iter().cloned().collect(),
@@ -561,23 +566,16 @@ impl Node {
     /// `None`. Derived from the deterministic download location, so it works
     /// even across restarts (no in-memory bookkeeping required).
     pub fn received_file_path(&self, transfer_id: [u8; 16], name: &str) -> Option<String> {
-        let path = blob_dest(&self.download_dir, &transfer_id, name);
+        let path = blob_dest(&self.ctx.download_dir, &transfer_id, name);
         path.exists().then(|| path.to_string_lossy().into_owned())
     }
 }
 
 /// Perform the Hello handshake on a freshly-opened connection, then spawn a
 /// reader loop to service subsequent frames. Returns once the peer is known.
-async fn setup_connection(
-    conn: Conn,
-    _my_id: PeerKey,
-    messaging: Arc<Mutex<MessagingAccount>>,
-    state: Arc<Mutex<State>>,
-    events: mpsc::UnboundedSender<EngineEvent>,
-    download_dir: PathBuf,
-) -> Result<PeerKey> {
+async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
     // Send our Hello with a fresh pre-key bundle.
-    let our_bundle = { messaging.lock().unwrap().prekey_bundle() };
+    let our_bundle = { ctx.messaging.lock().unwrap().prekey_bundle() };
     let hello = serde_json::to_vec(&Wire::Hello { bundle: our_bundle })?;
     conn.send_frame(&hello).await?;
 
@@ -590,12 +588,12 @@ async fn setup_connection(
         let frame = conn.recv_frame().await?;
         match serde_json::from_slice::<Wire>(&frame) {
             Ok(Wire::Hello { bundle }) => break bundle,
-            Ok(other) => handle_frame(other, peer, &messaging, &state, &events),
+            Ok(other) => handle_frame(other, peer, &ctx),
             Err(_) => continue, // skip malformed frames
         }
     };
     let generation = {
-        let mut st = state.lock().unwrap();
+        let mut st = ctx.state.lock().unwrap();
         st.bundles.insert(peer, bundle);
         // Trust-on-first-use: pin this id the first time we see it.
         st.pinned.entry(peer).or_insert(peer);
@@ -606,20 +604,11 @@ async fn setup_connection(
         st.conversations.entry(peer).or_default();
         generation
     };
-    let _ = events.send(EngineEvent::PeerConnected(peer));
+    let _ = ctx.events.send(EngineEvent::PeerConnected(peer));
 
     // Service the rest of the connection in the background.
     tokio::spawn(async move {
-        reader_loop(
-            conn,
-            peer,
-            generation,
-            messaging,
-            state,
-            events,
-            download_dir,
-        )
-        .await;
+        reader_loop(conn, peer, generation, ctx).await;
     });
 
     Ok(peer)
@@ -627,29 +616,19 @@ async fn setup_connection(
 
 /// Receive and process streams (control frames + blob transfers) for the life
 /// of a connection.
-async fn reader_loop(
-    conn: Conn,
-    peer: PeerKey,
-    generation: u64,
-    messaging: Arc<Mutex<MessagingAccount>>,
-    state: Arc<Mutex<State>>,
-    events: mpsc::UnboundedSender<EngineEvent>,
-    download_dir: PathBuf,
-) {
+async fn reader_loop(conn: Conn, peer: PeerKey, generation: u64, ctx: Arc<Ctx>) {
     loop {
         match conn.accept_incoming().await {
             Ok(Incoming::Frame(frame)) => {
                 if let Ok(wire) = serde_json::from_slice::<Wire>(&frame) {
-                    handle_frame(wire, peer, &messaging, &state, &events);
+                    handle_frame(wire, peer, &ctx);
                 }
             }
             Ok(Incoming::Blob(blob)) => {
                 // Download in the background so further frames aren't blocked.
-                let state = state.clone();
-                let events = events.clone();
-                let download_dir = download_dir.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    handle_blob(blob, peer, state, events, download_dir).await;
+                    handle_blob(blob, peer, ctx).await;
                 });
             }
             Err(_) => break, // connection closed
@@ -659,7 +638,7 @@ async fn reader_loop(
     // dead `Conn`, but only if it is still the registered one — a newer
     // reconnection (higher generation) must not be torn down by this old loop.
     let was_current = {
-        let mut st = state.lock().unwrap();
+        let mut st = ctx.state.lock().unwrap();
         if st.conn_gen.get(&peer).copied() == Some(generation) {
             st.conns.remove(&peer);
             st.conn_gen.remove(&peer);
@@ -669,31 +648,25 @@ async fn reader_loop(
         }
     };
     if was_current {
-        let _ = events.send(EngineEvent::PeerDisconnected(peer));
+        let _ = ctx.events.send(EngineEvent::PeerDisconnected(peer));
     }
 }
 
 /// Handle one decoded control frame.
-fn handle_frame(
-    wire: Wire,
-    peer: PeerKey,
-    messaging: &Arc<Mutex<MessagingAccount>>,
-    state: &Arc<Mutex<State>>,
-    events: &mpsc::UnboundedSender<EngineEvent>,
-) {
+fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
     match wire {
         Wire::Hello { bundle } => {
-            state.lock().unwrap().bundles.insert(peer, bundle);
+            ctx.state.lock().unwrap().bundles.insert(peer, bundle);
         }
         Wire::Message { ciphertext } => {
-            let Ok(payload) = decrypt_payload(peer, &ciphertext, messaging, state) else {
+            let Ok(payload) = decrypt_payload(peer, &ciphertext, ctx) else {
                 return;
             };
             match payload {
-                Payload::Chat(message) => apply_direct_message(peer, message, state, events),
+                Payload::Chat(message) => apply_direct_message(peer, message, ctx),
                 Payload::FileOffer { message, key } => {
                     if let MessageKind::File(ref f) = message.kind {
-                        state.lock().unwrap().pending_files.insert(
+                        ctx.state.lock().unwrap().pending_files.insert(
                             f.transfer_id,
                             PendingFile {
                                 key,
@@ -702,86 +675,81 @@ fn handle_frame(
                             },
                         );
                     }
-                    apply_direct_message(peer, message, state, events);
+                    apply_direct_message(peer, message, ctx);
                 }
                 Payload::GroupInvite(info) => {
                     let id = info.id;
                     {
-                        let mut st = state.lock().unwrap();
+                        let mut st = ctx.state.lock().unwrap();
                         st.groups.entry(id).or_insert(info);
                         st.group_convos.entry(id).or_default();
                     }
-                    let _ = events.send(EngineEvent::GroupInvited(id));
+                    let _ = ctx.events.send(EngineEvent::GroupInvited(id));
                 }
                 Payload::GroupMessage { group, message } => {
-                    state
+                    ctx.state
                         .lock()
                         .unwrap()
                         .group_convos
                         .entry(group)
                         .or_default()
                         .apply(message.clone());
-                    let _ = events.send(EngineEvent::GroupMessageReceived { group, message });
+                    let _ = ctx
+                        .events
+                        .send(EngineEvent::GroupMessageReceived { group, message });
                 }
             }
         }
         Wire::Typing => {
-            let _ = events.send(EngineEvent::Typing(peer));
+            let _ = ctx.events.send(EngineEvent::Typing(peer));
         }
         Wire::Presence { online } => {
-            let _ = events.send(EngineEvent::PresenceChanged { peer, online });
+            let _ = ctx
+                .events
+                .send(EngineEvent::PresenceChanged { peer, online });
         }
         Wire::Read { up_to } => {
-            state
+            ctx.state
                 .lock()
                 .unwrap()
                 .conversations
                 .entry(peer)
                 .or_default()
                 .mark_read(peer, up_to);
-            let _ = events.send(EngineEvent::ReadReceipt { peer, up_to });
+            let _ = ctx.events.send(EngineEvent::ReadReceipt { peer, up_to });
         }
     }
 }
 
 /// Apply a 1:1 message to the per-peer conversation and notify listeners.
-fn apply_direct_message(
-    peer: PeerKey,
-    message: Message,
-    state: &Arc<Mutex<State>>,
-    events: &mpsc::UnboundedSender<EngineEvent>,
-) {
-    state
+fn apply_direct_message(peer: PeerKey, message: Message, ctx: &Arc<Ctx>) {
+    ctx.state
         .lock()
         .unwrap()
         .conversations
         .entry(peer)
         .or_default()
         .apply(message.clone());
-    let _ = events.send(EngineEvent::MessageReceived { peer, message });
+    let _ = ctx
+        .events
+        .send(EngineEvent::MessageReceived { peer, message });
 }
 
 /// Receive a blob stream: wait for the matching offer, decrypt each chunk to a
 /// file, verify the content hash, and emit [`EngineEvent::FileReceived`].
-async fn handle_blob(
-    mut blob: BlobRecv,
-    peer: PeerKey,
-    state: Arc<Mutex<State>>,
-    events: mpsc::UnboundedSender<EngineEvent>,
-    download_dir: PathBuf,
-) {
+async fn handle_blob(mut blob: BlobRecv, peer: PeerKey, ctx: Arc<Ctx>) {
     let transfer_id = blob.transfer_id();
     // The offer frame may be processed after this stream is accepted (QUIC does
     // not order across streams), so wait briefly for it to register.
-    let Some((key, sha256, name)) = wait_for_offer(&state, transfer_id).await else {
+    let Some((key, sha256, name)) = wait_for_offer(&ctx.state, transfer_id).await else {
         // No offer arrived, so we have no key/name to even describe it.
         return;
     };
-    let dest = blob_dest(&download_dir, &transfer_id, &name);
+    let dest = blob_dest(&ctx.download_dir, &transfer_id, &name);
     let mut sink = match DecryptSink::create(&dest, key) {
         Ok(s) => s,
         Err(e) => {
-            let _ = events.send(EngineEvent::FileFailed {
+            let _ = ctx.events.send(EngineEvent::FileFailed {
                 peer,
                 transfer_id,
                 name,
@@ -794,7 +762,7 @@ async fn handle_blob(
         match blob.next_chunk().await {
             Ok(Some(chunk)) => {
                 if sink.write_chunk(&chunk).is_err() {
-                    let _ = events.send(EngineEvent::FileFailed {
+                    let _ = ctx.events.send(EngineEvent::FileFailed {
                         peer,
                         transfer_id,
                         name,
@@ -805,7 +773,7 @@ async fn handle_blob(
             }
             Ok(None) => break,
             Err(_) => {
-                let _ = events.send(EngineEvent::FileFailed {
+                let _ = ctx.events.send(EngineEvent::FileFailed {
                     peer,
                     transfer_id,
                     name,
@@ -817,8 +785,8 @@ async fn handle_blob(
     }
     match sink.finish(sha256) {
         Ok(path) => {
-            state.lock().unwrap().pending_files.remove(&transfer_id);
-            let _ = events.send(EngineEvent::FileReceived {
+            ctx.state.lock().unwrap().pending_files.remove(&transfer_id);
+            let _ = ctx.events.send(EngineEvent::FileReceived {
                 peer,
                 transfer_id,
                 name,
@@ -826,7 +794,7 @@ async fn handle_blob(
             });
         }
         Err(_) => {
-            let _ = events.send(EngineEvent::FileFailed {
+            let _ = ctx.events.send(EngineEvent::FileFailed {
                 peer,
                 transfer_id,
                 name,
@@ -861,28 +829,23 @@ async fn wait_for_offer(
 
 /// Decrypt a received ciphertext into a [`Payload`]: continue an existing
 /// session, or accept a new inbound session from a pre-key (handshake) message.
-fn decrypt_payload(
-    peer: PeerKey,
-    ciphertext: &[u8],
-    messaging: &Arc<Mutex<MessagingAccount>>,
-    state: &Arc<Mutex<State>>,
-) -> Result<Payload> {
-    let has_session = state.lock().unwrap().sessions.contains_key(&peer);
+fn decrypt_payload(peer: PeerKey, ciphertext: &[u8], ctx: &Arc<Ctx>) -> Result<Payload> {
+    let has_session = ctx.state.lock().unwrap().sessions.contains_key(&peer);
     let plaintext = if has_session {
-        let mut st = state.lock().unwrap();
+        let mut st = ctx.state.lock().unwrap();
         let session = st.sessions.get_mut(&peer).unwrap();
         session.decrypt(ciphertext)?
     } else {
         let their_identity_key = {
-            let st = state.lock().unwrap();
+            let st = ctx.state.lock().unwrap();
             st.bundles.get(&peer).map(|b| b.identity_key)
         }
         .ok_or_else(|| anyhow!("no bundle for peer; cannot accept session"))?;
         let (session, plaintext) = {
-            let mut acct = messaging.lock().unwrap();
+            let mut acct = ctx.messaging.lock().unwrap();
             RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
         };
-        state.lock().unwrap().sessions.insert(peer, session);
+        ctx.state.lock().unwrap().sessions.insert(peer, session);
         plaintext
     };
     Ok(serde_json::from_slice(&plaintext)?)
