@@ -465,12 +465,26 @@ impl Node {
         let _ = self.ctx.events.send(EngineEvent::ContactUpdated(peer));
     }
 
-    /// Forget a contact and its conversation (vault + memory).
+    /// Forget a contact and its conversation (vault + memory). Also purges
+    /// every other per-peer map so nothing stale survives to wedge a later
+    /// re-handshake: the live `Conn` (dropping it here is enough — the
+    /// reader loop's generation guard tolerates the entry already being
+    /// gone when the connection actually closes), the ratchet session, the
+    /// last-seen pre-key bundle, the connection generation tag, a deferred
+    /// post-connect flag, the peer's learned have-set, and any not-yet-
+    /// delivered queued message ids.
     pub fn remove_contact(&self, peer: PeerKey) -> Result<()> {
         {
             let mut st = self.ctx.state.lock().unwrap();
             st.contacts.remove(&peer);
             st.conversations.remove(&peer);
+            st.conns.remove(&peer);
+            st.sessions.remove(&peer);
+            st.bundles.remove(&peer);
+            st.conn_gen.remove(&peer);
+            st.pending_post_connect.remove(&peer);
+            st.peer_have.remove(&peer);
+            st.queued.remove(&peer);
         }
         if let Some(e) = &self.ctx.engine {
             e.delete_contact(&peer)?;
@@ -2438,5 +2452,49 @@ mod tests {
         assert!(!group_allows(&st, &gid, &stranger, &me));
         // Known group, peer is a member, but *we* are not.
         assert!(!group_allows(&st, &gid, &member, &stranger));
+    }
+
+    /// `remove_contact` must purge every per-peer session/connection map,
+    /// not just `contacts`/`conversations` — otherwise a stale entry could
+    /// wedge a later re-handshake with the same peer. Removal happens
+    /// while the connection to bob is still live (no explicit disconnect
+    /// first), which also proves that dropping the `conns` entry alone —
+    /// without capturing and closing the underlying `Conn` — leaves
+    /// nothing wedged: a fresh `connect` + `send_text` still converges
+    /// end-to-end afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remove_contact_purges_state_and_allows_rehandshake() -> Result<()> {
+        let (alice, _alice_rx) = Node::start([151u8; 32]).await?;
+        let (bob, mut bob_rx) = Node::start([152u8; 32]).await?;
+        let bob_id = bob.id();
+
+        timeout(Duration::from_secs(20), alice.connect(bob_id))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+        alice.send_text(bob_id, "before removal").await?;
+        wait_message(&mut bob_rx).await;
+        assert_eq!(alice.contacts().len(), 1);
+
+        alice.remove_contact(bob_id)?;
+        assert!(
+            alice.contacts().is_empty(),
+            "contact must be forgotten immediately"
+        );
+
+        // Fresh connect + send, with bob's original (never torn down)
+        // connection still alive in the background: no leftover
+        // conn/session/bundle may prevent a clean re-handshake.
+        timeout(Duration::from_secs(20), alice.connect(bob_id))
+            .await
+            .map_err(|_| anyhow!("reconnect timed out"))??;
+        alice.send_text(bob_id, "after removal").await?;
+        let got = wait_message(&mut bob_rx).await;
+        assert_eq!(got.body, "after removal");
+
+        // The re-handshake recreated the contact from scratch.
+        let contacts = alice.contacts();
+        assert_eq!(contacts.len(), 1, "re-handshake must recreate the contact");
+        assert_eq!(contacts[0].peer, bob_id);
+        Ok(())
     }
 }
