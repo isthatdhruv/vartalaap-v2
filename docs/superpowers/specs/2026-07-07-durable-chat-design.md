@@ -87,8 +87,13 @@ derivation.
   its own pin (a no-op). Instead, the contact record pins the peer's messaging
   identity key from their first `Hello` bundle; a mismatch on a later connect
   raises an "identity changed" warning.
-- **Deliberately unpersisted:** ratchet sessions and `MessagingAccount`.
-  Sessions become per-connection (below), so nothing durable exists to store.
+- **Persisted messaging account.** The vodozemac `MessagingAccount` is sealed
+  into the vault (`msg_account`, via its pickle) and re-saved whenever it
+  mutates (one-time-key generation/consumption). Without this the messaging
+  identity key would change on every app start and the TOFU pin would fire a
+  false "identity changed" warning on every restart.
+- **Deliberately unpersisted:** ratchet sessions. Sessions become
+  per-connection (below), so nothing durable exists to store.
 
 ## Protocol
 
@@ -102,6 +107,11 @@ Payload::SyncHave  { scope, ids }        // scope = Direct | Group(GroupId)
 Payload::SyncDelta { scope, messages, reactions, read }
 ```
 
+- **Connect-time initiator rule.** To avoid racing session initiation on
+  every connect, the peer with the lexicographically lower id sends its
+  post-connect payloads immediately; the higher-id peer queues its own until
+  a ratchet session is established (its first inbound decrypt), then flushes.
+  The PreKey tie-break below remains as a backstop for user-concurrent sends.
 - **Connect-time sequence.** After `Hello`, each side sends: `Profile`
   (signature verified AND signer id must equal the peer's key; stored if
   `updated_at` newer) → `GroupAnnounce` for each group containing the peer
