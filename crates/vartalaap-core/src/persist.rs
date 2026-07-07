@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use vartalaap_crypto::ratchet::MessagingAccount;
 use vartalaap_identity::Profile;
+use vartalaap_store::StoreError;
 use vartalaap_sync::Snapshot;
 
 use crate::node::{GroupInfo, PeerKey};
@@ -144,8 +145,8 @@ impl Engine {
     /// Load the persisted messaging account, or create-and-persist a fresh
     /// one. Keeping it stable across restarts keeps the TOFU pin meaningful.
     pub fn load_or_create_msg_account(&self) -> Result<MessagingAccount, CoreError> {
-        match self.store.get_secret(MSG_ACCOUNT_KEY)? {
-            Some(bytes) => match MessagingAccount::from_pickle_json(&bytes) {
+        match self.store.get_secret(MSG_ACCOUNT_KEY) {
+            Ok(Some(bytes)) => match MessagingAccount::from_pickle_json(&bytes) {
                 Ok(a) => Ok(a),
                 Err(_) => {
                     // Unreadable pickle: quarantine and start fresh rather
@@ -156,11 +157,20 @@ impl Engine {
                     Ok(a)
                 }
             },
-            None => {
+            Ok(None) => {
                 let a = MessagingAccount::new();
                 self.save_msg_account(&a)?;
                 Ok(a)
             }
+            Err(StoreError::Crypto(_)) => {
+                // Corrupted or wrong-key blob: quarantine and start fresh
+                // rather than refusing to start.
+                self.store.quarantine(MSG_ACCOUNT_KEY)?;
+                let a = MessagingAccount::new();
+                self.save_msg_account(&a)?;
+                Ok(a)
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -261,6 +271,44 @@ mod tests {
         let e = Engine::open(&dir, "pw").unwrap();
         let acct = e.load_or_create_msg_account().unwrap();
         assert_eq!(acct.identity_key(), ik, "messaging identity must be stable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `msg_account` blob sealed under the wrong key fails AEAD decryption
+    /// (`StoreError::Crypto`), not JSON parsing. That must be quarantined and
+    /// regenerated too, not just the "decrypts fine but bad pickle" case.
+    #[test]
+    fn corrupt_msg_account_is_quarantined_and_regenerated() {
+        let dir = tmpdir();
+        let ik = {
+            let e = Engine::open(&dir, "pw").unwrap();
+            let acct = e.load_or_create_msg_account().unwrap();
+            acct.identity_key()
+        }; // `e` fully dropped here: redb is single-writer.
+
+        {
+            let other = vartalaap_store::Store::open(
+                &dir.join("vault.redb"),
+                vartalaap_crypto::VaultKey::from([99u8; 32]),
+            )
+            .unwrap();
+            other.put_secret(MSG_ACCOUNT_KEY, b"junk").unwrap();
+        } // dropped before reopening with the real engine below.
+
+        let e = Engine::open(&dir, "pw").unwrap();
+        let acct = e.load_or_create_msg_account().unwrap();
+        assert_ne!(
+            acct.identity_key(),
+            ik,
+            "corrupted msg_account must be regenerated, not reused"
+        );
+
+        let acct2 = e.load_or_create_msg_account().unwrap();
+        assert_eq!(
+            acct2.identity_key(),
+            acct.identity_key(),
+            "the regenerated account must have been persisted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
