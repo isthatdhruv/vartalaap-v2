@@ -170,6 +170,12 @@ fn encode(message: OlmMessage) -> Vec<u8> {
     out
 }
 
+/// Whether a wire ciphertext produced by [`encode`] is an Olm PreKey
+/// (handshake) message. PreKey's numeric message type is 0.
+pub fn is_prekey(wire: &[u8]) -> bool {
+    wire.first() == Some(&0)
+}
+
 /// Decode a wire ciphertext produced by [`encode`].
 fn decode(wire: &[u8]) -> Result<OlmMessage, RatchetError> {
     let (message_type, ciphertext) = wire.split_first().ok_or(RatchetError::Malformed)?;
@@ -266,5 +272,23 @@ mod tests {
         let (_bs, plain) =
             RatchetSession::accept(&mut restored, alice.identity_key(), &first).unwrap();
         assert_eq!(plain, b"hi");
+    }
+
+    #[test]
+    fn is_prekey_distinguishes_message_types() {
+        let mut bob = MessagingAccount::new();
+        let bundle = bob.prekey_bundle();
+        let alice = MessagingAccount::new();
+        let (mut alice_session, first) =
+            RatchetSession::initiate(&alice, &bundle, b"open").unwrap();
+        assert!(is_prekey(&first), "first message is a PreKey message");
+
+        let (mut bob_session, _) =
+            RatchetSession::accept(&mut bob, alice.identity_key(), &first).unwrap();
+        let reply = bob_session.encrypt(b"ok").unwrap();
+        assert!(!is_prekey(&reply), "post-handshake replies are Normal");
+        alice_session.decrypt(&reply).unwrap();
+        let next = alice_session.encrypt(b"more").unwrap();
+        assert!(!is_prekey(&next));
     }
 }
