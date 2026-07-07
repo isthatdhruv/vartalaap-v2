@@ -68,6 +68,21 @@ impl MessagingAccount {
             one_time_key: one_time_key.to_bytes(),
         }
     }
+
+    /// Serialize the account (including unpublished one-time keys) for sealed
+    /// storage. The output is sensitive: callers must encrypt it at rest.
+    pub fn to_pickle_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.inner.pickle()).expect("account pickle serializes")
+    }
+
+    /// Restore an account previously serialized with [`to_pickle_json`].
+    pub fn from_pickle_json(bytes: &[u8]) -> Result<Self, RatchetError> {
+        let pickle: vodozemac::olm::AccountPickle = serde_json::from_slice(bytes)
+            .map_err(|e| RatchetError::SessionCreation(format!("bad account pickle: {e}")))?;
+        Ok(Self {
+            inner: Account::from_pickle(pickle),
+        })
+    }
 }
 
 /// Public bundle published by a peer so others can initiate a session.
@@ -230,5 +245,26 @@ mod tests {
         let last = m.len() - 1;
         m[last] ^= 0xff;
         assert!(bob_session.decrypt(&m).is_err());
+    }
+
+    /// The pickled account restores to the same messaging identity, and a
+    /// bundle from the restored account still accepts sessions.
+    #[test]
+    fn account_pickle_roundtrip_preserves_identity() {
+        let mut bob = MessagingAccount::new();
+        let ik = bob.identity_key();
+        let bundle = bob.prekey_bundle();
+
+        let pickled = bob.to_pickle_json();
+        let mut restored = MessagingAccount::from_pickle_json(&pickled).unwrap();
+        assert_eq!(restored.identity_key(), ik);
+
+        // A session initiated against the pre-pickle bundle must be accepted
+        // by the restored account (one-time key survived the roundtrip).
+        let alice = MessagingAccount::new();
+        let (_s, first) = RatchetSession::initiate(&alice, &bundle, b"hi").unwrap();
+        let (_bs, plain) =
+            RatchetSession::accept(&mut restored, alice.identity_key(), &first).unwrap();
+        assert_eq!(plain, b"hi");
     }
 }
