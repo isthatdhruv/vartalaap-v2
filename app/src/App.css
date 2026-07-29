@@ -638,3 +638,107 @@ button:hover {
   line-height: 1.5;
   color: var(--muted);
 }
+
+/* ------------------------------------------------------- Manual connect ---
+   Escape hatch for networks that drop multicast, so mDNS never reports a
+   peer. Lives under Nearby because that is where someone looks when the list
+   they expected is empty. */
+
+.manual-connect {
+  margin: 4px 8px 10px;
+  padding: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.manual-label {
+  font-size: 10.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* The code is long and must be selectable to copy by hand, but must not
+   stretch the sidebar. */
+.manual-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 8px;
+  max-height: 62px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.manual-input {
+  width: 100%;
+  padding: 7px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  outline: none;
+}
+
+.manual-input:focus {
+  border-color: var(--accent);
+}
+
+/* `.mini` inherits --panel-2, which is also this panel's own background, so
+   the buttons would read as plain text sitting in it. Give them an edge. */
+.mini.wide {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
+.mini.wide:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.mini.wide:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Remember-me on the unlock screen. The caveat is set in smaller, muted text
+   directly under the label rather than hidden behind a tooltip — it changes
+   who can open the vault, so it should be read before it is ticked. */
+.unlock-remember {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.unlock-remember input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.unlock-remember em {
+  display: block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  font-style: normal;
+  line-height: 1.45;
+  color: var(--muted);
+}

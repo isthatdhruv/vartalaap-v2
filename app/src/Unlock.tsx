@@ -7,6 +7,7 @@ type VaultStatus = {
   exists: boolean;
   unlocked: boolean;
   min_passphrase_len: number;
+  has_saved_passphrase: boolean;
 };
 
 /**
@@ -27,6 +28,7 @@ export default function Unlock({
   const [status, setStatus] = useState<VaultStatus | null>(null);
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [remember, setRemember] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -35,9 +37,25 @@ export default function Unlock({
     invoke<VaultStatus>("vault_status")
       .then((s) => {
         setStatus(s);
+        setRemember(s.has_saved_passphrase);
         // An already-unlocked vault means the window was reloaded while the
         // engine kept running; skip straight through rather than asking again.
-        if (s.unlocked) invoke<WhoAmI>("whoami").then(onUnlocked).catch(() => {});
+        if (s.unlocked) {
+          invoke<WhoAmI>("whoami").then(onUnlocked).catch(() => {});
+          return;
+        }
+        // A remembered passphrase means going straight in. If it no longer
+        // opens the vault the backend forgets it, and we fall back to asking.
+        if (s.has_saved_passphrase) {
+          setBusy(true);
+          invoke<WhoAmI>("unlock_with_saved")
+            .then(onUnlocked)
+            .catch(() => {
+              setBusy(false);
+              setRemember(false);
+              setError("Saved passphrase no longer works — please enter it.");
+            });
+        }
       })
       .catch((e) => setError(String(e)));
   }, [onUnlocked]);
@@ -62,7 +80,7 @@ export default function Unlock({
     setBusy(true);
     setError(null);
     try {
-      const me = await invoke<WhoAmI>("unlock", { passphrase });
+      const me = await invoke<WhoAmI>("unlock", { passphrase, remember });
       onUnlocked(me);
     } catch (err) {
       setError(String(err));
@@ -120,6 +138,22 @@ export default function Unlock({
         )}
         {mismatch && <div className="unlock-hint">Passphrases don't match.</div>}
         {error && <div className="unlock-error">{error}</div>}
+
+        <label className="unlock-remember">
+          <input
+            type="checkbox"
+            checked={remember}
+            disabled={busy}
+            onChange={(e) => setRemember(e.target.checked)}
+          />
+          <span>
+            Remember this passphrase
+            <em>
+              Kept in your operating system's credential store. Anyone who can
+              log in as you can then open this vault without being asked.
+            </em>
+          </span>
+        </label>
 
         <button className="unlock-button" type="submit" disabled={!canSubmit}>
           {busy ? "Unlocking…" : creating ? "Create vault" : "Unlock"}

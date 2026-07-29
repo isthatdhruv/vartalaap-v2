@@ -77,6 +77,12 @@ export default function App() {
   const [banners, setBanners] = useState<Banner[]>([]);
   const [editingAlias, setEditingAlias] = useState(false);
   const [aliasDraft, setAliasDraft] = useState("");
+  // Manual connect-by-code, for networks where mDNS never arrives.
+  const [showManual, setShowManual] = useState(false);
+  const [myCode, setMyCode] = useState<string | null>(null);
+  const [peerCode, setPeerCode] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const selectedRef = useRef<Target | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
@@ -218,6 +224,32 @@ export default function App() {
     if (!selected) return;
     invoke("mark_read", { kind: selected.kind, id: selected.id }).catch(() => {});
   }, [selected, messages.length]);
+
+  // Our own code is only fetched when the panel is opened: it needs the
+  // engine's bound addresses, which do not exist until the vault is unlocked.
+  useEffect(() => {
+    if (!showManual || !unlocked || myCode) return;
+    invoke<string>("my_connect_code")
+      .then(setMyCode)
+      .catch((e) => pushBanner({ kind: "error", text: `Could not read your connect code: ${e}` }));
+  }, [showManual, unlocked, myCode, pushBanner]);
+
+  const connectByCode = async () => {
+    const code = peerCode.trim();
+    if (!code || connecting) return;
+    setConnecting(true);
+    try {
+      const id = await invoke<string>("connect_by_code", { code });
+      setPeerCode("");
+      setShowManual(false);
+      await refreshRoster();
+      selectPeer(id);
+    } catch (e) {
+      pushBanner({ kind: "error", text: `Connect failed: ${e}` });
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   const selectPeer = (id: string) => {
     setSelected({ kind: "peer", id });
@@ -418,7 +450,16 @@ export default function App() {
           ))}
         </ul>
 
-        <div className="section-label">Nearby</div>
+        <div className="section-title">
+          Nearby
+          <button
+            className="mini"
+            title="Connect by code, for networks that block discovery"
+            onClick={() => setShowManual((s) => !s)}
+          >
+            {showManual ? "×" : "+"}
+          </button>
+        </div>
         <ul className="peers">
           {nearby.length === 0 && <li className="empty">Searching the LAN…</li>}
           {nearby.map((n) => (
@@ -429,6 +470,47 @@ export default function App() {
             </li>
           ))}
         </ul>
+
+        {/* Discovery is multicast, and plenty of networks drop it. This is the
+            way through: swap codes out-of-band and dial directly. */}
+        {showManual && (
+          <div className="manual-connect">
+            <div className="manual-label">Your code — share it</div>
+            <div className="manual-code" title={myCode || ""}>
+              {myCode ?? "…"}
+            </div>
+            <button
+              className="mini wide"
+              disabled={!myCode}
+              onClick={() => {
+                if (myCode) navigator.clipboard.writeText(myCode);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+            >
+              {copied ? "Copied" : "Copy my code"}
+            </button>
+
+            <div className="manual-label">Their code — paste it</div>
+            <input
+              className="manual-input"
+              value={peerCode}
+              placeholder="id@192.168.0.49:1234"
+              spellCheck={false}
+              onChange={(e) => setPeerCode(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") connectByCode();
+              }}
+            />
+            <button
+              className="mini wide"
+              disabled={!peerCode.trim() || connecting}
+              onClick={connectByCode}
+            >
+              {connecting ? "Connecting…" : "Connect"}
+            </button>
+          </div>
+        )}
 
         <div className="section-title">
           Groups
