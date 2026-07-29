@@ -215,16 +215,28 @@ implementation (Tasks 1–12):
   back after merging a non-empty delta (without it the sender of a queued
   message never learns of delivery; bounded, terminates on empty deltas).
 - `IrohTransport::closed()` added to vartalaap-net so `Node::shutdown()`
-  deterministically drains the discovery loop and releases the vault.
+  drains the discovery loop and releases the vault. **Amended 2026-07-29:**
+  closing the endpoint only *starts* the drain — reader loops and dial
+  tasks still held an `Arc<Ctx>`, and with it the redb file lock, so
+  reopening the same data directory right after shutdown could fail with
+  "Database already open" (5/30 runs). `shutdown` now also waits, bounded
+  at ~2s, for that `Arc` to become uniquely held.
 - Group-announce ack: a newly-learned group (announce OR invite) replies
   with a SyncHave for that group so late-joining members backfill.
 - `send_group` Tauri command kept its unit return (group per-member
   delivery status is out of scope).
-- Known residual (documented, future work): back-to-back sends immediately
-  after a fresh connect can lose the live MessageReceived event for the
-  second message due to pre-convergence session races — content always
-  heals via delta sync (HistorySynced); live GroupMessage/GroupInvite arms
-  remain membership-ungated pending group authenticity.
+- ~~Known residual: back-to-back sends immediately after a fresh connect
+  can lose the live MessageReceived event; live GroupMessage/GroupInvite
+  arms remain membership-ungated.~~ **Closed 2026-07-29 (v1.0.0).** The
+  lost-event residual had two independent causes, both fixed: a peer's
+  second pre-key message was re-accepted against a one-time key the
+  first accept had already spent (`State::inbound_sessions` now retains a
+  peer-initiated session we do not adopt), and `setup_connection` never
+  cleared per-peer sessions, so a stale one survived a reconnect and kept
+  emitting pre-key messages naming a spent key. Frames overtaking a
+  peer's Hello are also now buffered and replayed once the bundle lands,
+  rather than handled while undecryptable. GroupInvite is gated by
+  `group_info_admits`, shared with GroupAnnounce.
 - Delivered status is session-transient (peer_have); after a restart, own
   delivered messages render as single-tick until the next sync round
   restores the double tick.
