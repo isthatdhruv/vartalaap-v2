@@ -106,35 +106,41 @@ jobs:
   # Debian 11), where webkit2gtk-4.1 isn't available natively. The GNOME runtime
   # provides it inside the sandbox.
   flatpak:
-    runs-on: ubuntu-22.04
-    # Runs after `build` so the draft release already exists by the time the
-    # bundle is attached to it below.
+    # 24.04, not 22.04, and the reason is specific: flatpak-builder 1.2 (what
+    # 22.04 ships) invokes `appstream-compose` inside the SDK to process the
+    # metainfo. AppStream 1.0 replaced that binary with `appstreamcli compose`,
+    # so it no longer exists in the GNOME 47 runtime and the build died with
+    # "bwrap: execvp appstream-compose: No such file or directory".
+    # flatpak-builder 1.4 on 24.04 calls the new one.
+    #
+    # The binary inside the bundle is still the one built on 22.04 — it is
+    # downloaded from the `build` job rather than recompiled here, which keeps
+    # the glibc floor *and* saves six minutes of duplicate work.
+    runs-on: ubuntu-24.04
+    # Also orders us after the draft release exists, for the upload below.
     needs: build
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build + flatpak tooling
+      - name: Install flatpak tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
-            libxdo-dev libssl-dev build-essential flatpak flatpak-builder
+          sudo apt-get install -y flatpak flatpak-builder
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - name: Fetch the .deb built on 22.04
+        uses: actions/download-artifact@v4
         with:
-          node-version: 20
-
-      - name: Build the .deb (on 22.04, for glibc 2.35)
-        working-directory: app
-        run: |
-          npm ci
-          npm run tauri build -- --bundles deb
+          name: vartalaap-ubuntu-22.04
+          path: linux-bundles
 
       - name: Stage the .deb for the Flatpak manifest
-        run: cp app/src-tauri/target/release/bundle/deb/*.deb packaging/flatpak/vartalaap.deb
+        run: |
+          deb="$(find linux-bundles -name '*.deb' | head -1)"
+          test -n "$deb" || { echo "no .deb in the build artifact"; exit 1; }
+          echo "using $deb"
+          cp "$deb" packaging/flatpak/vartalaap.deb
 
       - name: Install GNOME runtime
         run: |
