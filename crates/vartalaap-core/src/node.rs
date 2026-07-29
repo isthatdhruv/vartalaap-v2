@@ -926,9 +926,29 @@ impl Node {
         path.exists().then(|| path.to_string_lossy().into_owned())
     }
 
-    /// Close the endpoint so the accept loop ends and background tasks drain.
+    /// Close the endpoint so the accept loop ends and background tasks drain,
+    /// then wait for those tasks to actually let go of the vault.
+    ///
+    /// Closing the transport only *starts* the drain: reader loops, dial tasks
+    /// and the discovery loop each hold an `Arc<Ctx>`, and `Ctx` owns the
+    /// `Engine` that holds redb's exclusive file lock. Returning as soon as the
+    /// endpoint closed therefore left the database open for an unpredictable
+    /// moment afterwards, so a caller that shut down and immediately reopened
+    /// the same data directory could hit "Database already open. Cannot
+    /// acquire lock." Waiting until we hold the only reference makes shutdown
+    /// mean what callers assume it means.
+    ///
+    /// Bounded: after ~2s we return anyway rather than hang a UI on a wedged
+    /// background task. Callers that reopen immediately are the ones that care,
+    /// and they are far better served by a rare race than by a stuck exit.
     pub async fn shutdown(&self) {
         self.ctx.transport.close().await;
+        for _ in 0..200 {
+            if Arc::strong_count(&self.ctx) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -1158,14 +1178,23 @@ async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
 
     // Receive the peer's Hello. Each frame rides its own QUIC stream and QUIC
     // does not order across streams, so an application frame can legally be
-    // accepted before the Hello. Process any such early frames best-effort and
-    // keep waiting for the Hello instead of aborting the whole connection.
+    // accepted before the Hello — and a peer that dials and immediately sends
+    // makes that the common case, not a rarity.
+    //
+    // Such frames are *buffered*, not handled here. Handling them now would
+    // drop them: an encrypted frame needs the sender's pre-key bundle to open
+    // a session, and that bundle is exactly what this loop is still waiting
+    // for. The message would fail to decrypt and vanish, leaving the content
+    // to reappear later via delta sync as `HistorySynced` — no live
+    // `MessageReceived`, so the UI shows nothing until something else
+    // refreshes it. Replayed below, in arrival order, once the bundle is in.
     let peer = conn.remote_id_bytes();
+    let mut early_frames = Vec::new();
     let bundle = loop {
         let frame = conn.recv_frame().await?;
         match serde_json::from_slice::<Wire>(&frame) {
             Ok(Wire::Hello { bundle }) => break bundle,
-            Ok(other) => handle_frame(other, peer, &ctx),
+            Ok(other) => early_frames.push(other),
             Err(_) => continue, // skip malformed frames
         }
     };
@@ -1174,6 +1203,17 @@ async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
         let mut st = ctx.state.lock().unwrap();
         st.bundles.insert(peer, bundle);
         st.conns.insert(peer, conn.clone());
+        // Sessions are per-connection, so a new connection starts from a clean
+        // slate. Relying on the old reader loop to evict them is not enough:
+        // its generation guard deliberately declines to touch state once a
+        // newer connection is registered, so a loop that wakes late leaves its
+        // session behind. Reusing one is not merely untidy — a session that
+        // never received a reply keeps emitting *pre-key* messages naming the
+        // one-time key it was opened with, and the peer consumed that key long
+        // ago. Those messages fail to decrypt and are dropped, so the content
+        // only reappears later via delta sync.
+        st.sessions.remove(&peer);
+        st.inbound_sessions.remove(&peer);
         let generation = st.next_gen;
         st.next_gen += 1;
         st.conn_gen.insert(peer, generation);
@@ -1198,6 +1238,13 @@ async fn setup_connection(conn: Conn, ctx: Arc<Ctx>) -> Result<PeerKey> {
         let _ = ctx.events.send(EngineEvent::ContactUpdated(peer));
     }
     let _ = ctx.events.send(EngineEvent::PeerConnected(peer));
+
+    // Now that the peer's bundle is registered, the frames that overtook their
+    // Hello can be handled for real — before the reader loop starts, so they
+    // stay ahead of anything that arrives next.
+    for wire in early_frames {
+        handle_frame(wire, peer, &ctx);
+    }
 
     // Initiator rule: the lower-id side sends first, so the higher side
     // always has a session to decrypt into by the time it flushes its own
