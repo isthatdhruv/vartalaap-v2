@@ -108,7 +108,20 @@ pub enum EngineEvent {
 #[derive(Default)]
 struct State {
     conversations: HashMap<PeerKey, Conversation>,
+    /// The session we encrypt with, and decrypt with first.
     sessions: HashMap<PeerKey, RatchetSession>,
+    /// A session accepted from a peer's own initiation that we did *not* adopt
+    /// as primary, because the tie-break in `decrypt_payload` kept ours.
+    ///
+    /// Retaining it is what makes back-to-back first sends survive. When both
+    /// sides initiate at once, every message the peer sends before it hears
+    /// from us is a *pre-key* message on their session. We can only accept
+    /// such a message once — `RatchetSession::accept` burns the one-time key
+    /// it names, so a second accept of the same initiation fails and the
+    /// message is lost (it heals later via delta sync, but the live event
+    /// never fires). Keeping their session here lets every subsequent pre-key
+    /// message decrypt on the session we already built instead.
+    inbound_sessions: HashMap<PeerKey, RatchetSession>,
     /// The most recent pre-key bundle a peer published to us.
     bundles: HashMap<PeerKey, PreKeyBundle>,
     conns: HashMap<PeerKey, Conn>,
@@ -489,24 +502,37 @@ impl Node {
 
     /// Forget a contact and its conversation (vault + memory). Also purges
     /// every other per-peer map so nothing stale survives to wedge a later
-    /// re-handshake: the live `Conn` (dropping it here is enough — the
-    /// reader loop's generation guard tolerates the entry already being
-    /// gone when the connection actually closes), the ratchet session, the
-    /// last-seen pre-key bundle, the connection generation tag, a deferred
-    /// post-connect flag, the peer's learned have-set, and any not-yet-
-    /// delivered queued message ids.
+    /// re-handshake: the live `Conn`, both ratchet sessions, the last-seen
+    /// pre-key bundle, the connection generation tag, a deferred post-connect
+    /// flag, the peer's learned have-set, and any not-yet-delivered queued
+    /// message ids.
+    ///
+    /// Removing the `Conn` from the map is *not* enough on its own: the
+    /// reader loop servicing this peer owns its own clone of the handle, so
+    /// it would stay parked in `accept_incoming` and keep decoding, applying
+    /// and persisting frames from a peer we just forgot — re-creating the
+    /// contact row on the next inbound Hello. Closing the connection wakes
+    /// that loop with an error so it exits. Its generation guard then finds
+    /// the entry already gone and correctly declines to evict anything.
     pub fn remove_contact(&self, peer: PeerKey) -> Result<()> {
-        {
+        let conn = {
             let mut st = self.ctx.state.lock().unwrap();
             st.contacts.remove(&peer);
             st.conversations.remove(&peer);
-            st.conns.remove(&peer);
+            let conn = st.conns.remove(&peer);
             st.sessions.remove(&peer);
+            st.inbound_sessions.remove(&peer);
             st.bundles.remove(&peer);
             st.conn_gen.remove(&peer);
             st.pending_post_connect.remove(&peer);
             st.peer_have.remove(&peer);
             st.queued.remove(&peer);
+            conn
+        };
+        // Outside the state lock: `close` reaches into the transport, and the
+        // reader loop it wakes immediately wants that same lock.
+        if let Some(conn) = conn {
+            conn.close();
         }
         if let Some(e) = &self.ctx.engine {
             e.delete_contact(&peer)?;
@@ -1219,7 +1245,10 @@ async fn reader_loop(conn: Conn, peer: PeerKey, generation: u64, ctx: Arc<Ctx>) 
         if st.conn_gen.get(&peer).copied() == Some(generation) {
             st.conns.remove(&peer);
             st.conn_gen.remove(&peer);
-            st.sessions.remove(&peer); // sessions are per-connection
+            // Sessions are per-connection — both the one we encrypt with and
+            // any peer-initiated one we kept only to decrypt with.
+            st.sessions.remove(&peer);
+            st.inbound_sessions.remove(&peer);
             if let Some(c) = st.contacts.get_mut(&peer) {
                 c.last_seen = now_millis();
             }
@@ -1264,6 +1293,16 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                     apply_direct_message(peer, message, ctx);
                 }
                 Payload::GroupInvite(info) => {
+                    // Same admission check as `GroupAnnounce`: an invite is
+                    // only meaningful from someone who is themselves in the
+                    // group, and only if it actually names us. Without this,
+                    // any handshaked peer could push arbitrary GroupInfo —
+                    // adding us to groups we were never part of, or minting
+                    // unbounded phantom `group/` + `gconvo/` vault blobs from
+                    // fabricated group ids.
+                    if !group_info_admits(&info, &peer, &ctx.my_id) {
+                        return;
+                    }
                     let id = info.id;
                     let inserted = {
                         let mut st = ctx.state.lock().unwrap();
@@ -1339,7 +1378,7 @@ fn handle_frame(wire: Wire, peer: PeerKey, ctx: &Arc<Ctx>) {
                 }
                 Payload::GroupAnnounce(info) => {
                     // Only meaningful if the sender and we are both members.
-                    if !info.members.contains(&peer) || !info.members.contains(&ctx.my_id) {
+                    if !group_info_admits(&info, &peer, &ctx.my_id) {
                         return;
                     }
                     let id = info.id;
@@ -1489,6 +1528,19 @@ fn group_allows(st: &State, gid: &GroupId, peer: &PeerKey, me: &PeerKey) -> bool
         Some(g) => g.members.contains(peer) && g.members.contains(me),
         None => false,
     }
+}
+
+/// Admission gate for group metadata arriving from `peer` about a group we may
+/// not know yet — the `GroupInvite` and `GroupAnnounce` handlers.
+///
+/// [`group_allows`] cannot serve here: it answers from our *own* roster, and
+/// the whole point of an invite is that the group is new to us. So we judge the
+/// claim on its own contents instead: the sender must be a member of the group
+/// they are telling us about, and it must actually name us. That is weaker than
+/// a signature — a member can still lie about the roster — but it stops any
+/// merely-handshaked stranger from writing group state into our vault.
+fn group_info_admits(info: &GroupInfo, peer: &PeerKey, me: &PeerKey) -> bool {
+    info.members.contains(peer) && info.members.contains(me)
 }
 
 /// Answer a peer's have-list with everything they're missing in `scope`.
@@ -1728,33 +1780,59 @@ async fn wait_for_offer(
     None
 }
 
+/// Try every session we already hold for `peer`: the primary (the one we also
+/// encrypt with) first, then a peer-initiated session we accepted but did not
+/// adopt. `None` means we hold no session at all, so the caller must accept a
+/// fresh handshake; `Some(Err(_))` means we hold at least one and none of them
+/// could read this ciphertext.
+fn decrypt_with_known_sessions(
+    st: &mut State,
+    peer: &PeerKey,
+    ciphertext: &[u8],
+) -> Option<std::result::Result<Vec<u8>, vartalaap_crypto::ratchet::RatchetError>> {
+    let primary = st.sessions.get_mut(peer).map(|s| s.decrypt(ciphertext));
+    match primary {
+        Some(Ok(plaintext)) => Some(Ok(plaintext)),
+        primary_failure => {
+            let inbound = st
+                .inbound_sessions
+                .get_mut(peer)
+                .map(|s| s.decrypt(ciphertext));
+            match inbound {
+                Some(Ok(plaintext)) => Some(Ok(plaintext)),
+                // Report the primary's failure in preference to the
+                // secondary's — it is the session the caller cares about.
+                inbound_failure => primary_failure.or(inbound_failure),
+            }
+        }
+    }
+}
+
 /// Decrypt a received ciphertext into a [`Payload`]: continue an existing
 /// session, or accept a new inbound session from a pre-key (handshake) message.
 fn decrypt_payload(peer: PeerKey, ciphertext: &[u8], ctx: &Arc<Ctx>) -> Result<Payload> {
-    // Look up and use the session in ONE lock scope: sessions are evicted by
+    // Look up and use the sessions in ONE lock scope: sessions are evicted by
     // reader_loop when a connection dies, so a separate "has session" check
     // followed by a second lock + unwrap would race that eviction and panic
     // while holding the state guard (poisoning the mutex node-wide). decrypt
     // is synchronous, so no `.await` runs under the lock.
     let attempt = {
         let mut st = ctx.state.lock().unwrap();
-        st.sessions
-            .get_mut(&peer)
-            .map(|session| session.decrypt(ciphertext))
+        decrypt_with_known_sessions(&mut st, &peer, ciphertext)
     };
     let plaintext = match attempt {
         Some(Ok(p)) => p,
         // The peer initiated a competing session (both sides sent first
         // messages concurrently, or the peer restarted). We always try to
         // recover this message via a fresh accept — otherwise its content
-        // is silently and permanently lost, which is exactly the bug this
-        // task fixes. Deterministic winner for which session survives
-        // going forward: the initiation from the lexicographically LOWER
-        // id. We adopt theirs as our stored session only if they are the
-        // lower side; otherwise we keep our own stored session (so both
-        // sides converge on exactly one survivor) but still deliver the
-        // content we just recovered. Any remainder heals via delta sync
-        // (Task 8).
+        // is silently and permanently lost. Deterministic winner for which
+        // session survives going forward: the initiation from the
+        // lexicographically LOWER id. We adopt theirs as our *primary* only
+        // if they are the lower side; otherwise we keep our own (so both
+        // sides converge on exactly one survivor) — but we still keep theirs
+        // as the inbound session, because they will go on sending pre-key
+        // messages on it until they hear from us, and each one can only be
+        // accepted once.
         Some(Err(_)) if vartalaap_crypto::ratchet::is_prekey(ciphertext) => {
             let their_identity_key = {
                 let st = ctx.state.lock().unwrap();
@@ -1765,8 +1843,15 @@ fn decrypt_payload(peer: PeerKey, ciphertext: &[u8], ctx: &Arc<Ctx>) -> Result<P
                 let mut acct = ctx.messaging.lock().unwrap();
                 RatchetSession::accept(&mut acct, their_identity_key, ciphertext)?
             };
-            if peer < ctx.my_id {
-                ctx.state.lock().unwrap().sessions.insert(peer, session);
+            {
+                let mut st = ctx.state.lock().unwrap();
+                if peer < ctx.my_id {
+                    st.sessions.insert(peer, session);
+                    // Ours lost the tie-break; nothing may still arrive on it.
+                    st.inbound_sessions.remove(&peer);
+                } else {
+                    st.inbound_sessions.insert(peer, session);
+                }
             }
             persist_msg_account(ctx);
             plaintext
@@ -2478,12 +2563,11 @@ mod tests {
 
     /// `remove_contact` must purge every per-peer session/connection map,
     /// not just `contacts`/`conversations` — otherwise a stale entry could
-    /// wedge a later re-handshake with the same peer. Removal happens
-    /// while the connection to bob is still live (no explicit disconnect
-    /// first), which also proves that dropping the `conns` entry alone —
-    /// without capturing and closing the underlying `Conn` — leaves
-    /// nothing wedged: a fresh `connect` + `send_text` still converges
-    /// end-to-end afterwards.
+    /// wedge a later re-handshake with the same peer. Removal happens while
+    /// the connection to bob is still live (no explicit disconnect first), so
+    /// this also proves that tearing that connection down leaves nothing
+    /// wedged: a fresh `connect` + `send_text` still converges end-to-end
+    /// afterwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn remove_contact_purges_state_and_allows_rehandshake() -> Result<()> {
         let (alice, _alice_rx) = Node::start([151u8; 32]).await?;
@@ -2517,6 +2601,118 @@ mod tests {
         let contacts = alice.contacts();
         assert_eq!(contacts.len(), 1, "re-handshake must recreate the contact");
         assert_eq!(contacts[0].peer, bob_id);
+        Ok(())
+    }
+
+    /// `group_info_admits` is the admission gate for group metadata about a
+    /// group we may not know yet (`GroupInvite` / `GroupAnnounce`). Unlike
+    /// `group_allows` it judges the *claim*, since our roster has nothing to
+    /// check against for a genuinely new group.
+    #[test]
+    fn group_info_admits_requires_sender_and_self_in_the_claimed_roster() {
+        let gid: GroupId = [3u8; 16];
+        let me: PeerKey = [0xAA; 32];
+        let member: PeerKey = [0xBB; 32];
+        let stranger: PeerKey = [0xCC; 32];
+        let info = |members: Vec<PeerKey>| GroupInfo {
+            id: gid,
+            name: "study".into(),
+            members,
+            creator: member,
+        };
+
+        // The inviter is in the group and the invite names us.
+        assert!(group_info_admits(&info(vec![me, member]), &member, &me));
+        // A stranger pushing a group they are not themselves part of.
+        assert!(!group_info_admits(&info(vec![me, member]), &stranger, &me));
+        // A member inviting us to a group whose roster omits us.
+        assert!(!group_info_admits(&info(vec![member]), &member, &me));
+        // Neither party is in the claimed roster.
+        assert!(!group_info_admits(&info(vec![stranger]), &stranger, &me));
+    }
+
+    /// When both sides initiate at once and we win the tie-break, we keep our
+    /// own session as primary but must *retain* the peer's session too. Every
+    /// message they send before hearing from us is a pre-key message on that
+    /// session, and `RatchetSession::accept` burns the one-time key it names —
+    /// so re-accepting the second one fails and the message is lost. Holding
+    /// the session lets it decrypt normally.
+    ///
+    /// Exercised at the unit level against `decrypt_with_known_sessions`: the
+    /// bug is entirely in session bookkeeping, and driving two nodes into a
+    /// genuine concurrent-initiation race over real QUIC is timing-dependent.
+    #[test]
+    fn kept_inbound_session_decrypts_a_peers_later_prekey_messages() {
+        use vartalaap_crypto::ratchet::MessagingAccount;
+
+        let peer: PeerKey = [0xBB; 32];
+        let mut us = MessagingAccount::new();
+        let our_bundle = us.prekey_bundle();
+        let them = MessagingAccount::new();
+
+        // They initiate and — never having heard back — send twice. Both are
+        // pre-key messages naming the same one-time key.
+        let (mut their_session, first) =
+            RatchetSession::initiate(&them, &our_bundle, b"\"one\"").unwrap();
+        let second = their_session.encrypt(b"\"two\"").unwrap();
+        assert!(vartalaap_crypto::ratchet::is_prekey(&first));
+        assert!(vartalaap_crypto::ratchet::is_prekey(&second));
+
+        // We accept the first, but keep it only as the inbound session (the
+        // tie-break kept some session of ours as primary).
+        let (accepted, plaintext) =
+            RatchetSession::accept(&mut us, them.identity_key(), &first).unwrap();
+        assert_eq!(plaintext, b"\"one\"");
+        let mut st = State::default();
+        st.inbound_sessions.insert(peer, accepted);
+
+        // The second message must decrypt on the session we kept. Re-accepting
+        // is what used to happen here, and it cannot work:
+        assert!(
+            RatchetSession::accept(&mut us, them.identity_key(), &second).is_err(),
+            "the one-time key is spent, so a second accept must fail — this is \
+             why the session has to be retained"
+        );
+        let got = decrypt_with_known_sessions(&mut st, &peer, &second)
+            .expect("a session is held for this peer")
+            .expect("the retained inbound session decrypts it");
+        assert_eq!(got, b"\"two\"");
+    }
+
+    /// With no session at all for a peer, the caller must be told to accept a
+    /// fresh handshake rather than handed a decryption failure.
+    #[test]
+    fn decrypt_with_known_sessions_reports_no_session_distinctly() {
+        let mut st = State::default();
+        assert!(decrypt_with_known_sessions(&mut st, &[0xCC; 32], b"\x00garbage").is_none());
+    }
+
+    /// `remove_contact` must actually tear the connection down, not merely
+    /// forget it: the reader loop owns its own clone of the `Conn`, so a
+    /// dropped map entry leaves it parked in `accept_incoming`, still ready to
+    /// apply and persist frames from a peer we have forgotten. Proof from the
+    /// far side — bob observes the disconnect without alice calling shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remove_contact_closes_the_live_connection() -> Result<()> {
+        let (alice, _alice_rx) = Node::start([153u8; 32]).await?;
+        let (bob, mut bob_rx) = Node::start([154u8; 32]).await?;
+        let (alice_id, bob_id) = (alice.id(), bob.id());
+
+        timeout(Duration::from_secs(20), alice.connect(bob_id))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+        alice.send_text(bob_id, "still friends").await?;
+        wait_message(&mut bob_rx).await;
+
+        alice.remove_contact(bob_id)?;
+
+        // Bob's reader loop can only wake like this if the QUIC connection was
+        // closed; forgetting the map entry alone would leave it parked.
+        wait_for(
+            &mut bob_rx,
+            |e| matches!(e, EngineEvent::PeerDisconnected(p) if *p == alice_id),
+        )
+        .await;
         Ok(())
     }
 
