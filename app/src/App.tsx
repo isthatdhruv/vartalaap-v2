@@ -86,6 +86,14 @@ export default function App() {
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   selectedRef.current = selected;
 
+  // Stable identity: `Unlock` keys its mount effect on this, so a fresh
+  // closure every render would re-run the vault-status probe.
+  const handleUnlocked = useCallback((w: WhoAmI) => {
+    setMe(w);
+    setNameDraft(w.display_name);
+    setUnlocked(true);
+  }, []);
+
   const pushBanner = useCallback((b: Banner) => {
     setBanners((prev) =>
       prev.some((x) => x.kind === b.kind && x.text === b.text && x.peer === b.peer)
@@ -354,17 +362,7 @@ export default function App() {
     }
   };
 
-  if (!unlocked) {
-    return (
-      <Unlock
-        onUnlocked={(w) => {
-          setMe(w);
-          setNameDraft(w.display_name);
-          setUnlocked(true);
-        }}
-      />
-    );
-  }
+  if (!unlocked) return <Unlock onUnlocked={handleUnlocked} />;
 
   return (
     <div className="app">
