@@ -110,13 +110,25 @@ page (produced by CI for every platform), or build from source below.
 | Windows 10/11 | `.exe` | run the installer (WebView2 is bootstrapped automatically) |
 | macOS | `.dmg` | open and drag to Applications |
 
-> **The installers are not code-signed** (that needs paid Apple/Microsoft
-> developer certificates), so the OS will object the first time:
-> - **macOS** — "Vartalaap can't be opened because it is from an unidentified
->   developer." Right-click the app → **Open** → **Open**, or allow it under
->   *System Settings → Privacy & Security*.
-> - **Windows** — SmartScreen shows "Windows protected your PC." Click **More
->   info** → **Run anyway**.
+> **The installers are not code-signed or notarized** (that needs paid
+> Apple/Microsoft developer certificates), so the OS will object the first time.
+>
+> **macOS** — the `.dmg` is *universal*: one file that runs natively on both
+> Intel and Apple Silicon, macOS 10.13 or newer. But Gatekeeper will block it:
+> 1. Drag Vartalaap to Applications and try to open it once. It will be refused.
+> 2. Open *System Settings → Privacy & Security*, scroll down, and click
+>    **Open Anyway** next to the message about Vartalaap.
+>
+> On **macOS 15 (Sequoia) and newer this is the only route** — Apple removed the
+> old Control-click → *Open* shortcut, so that no longer works. If the app was
+> copied off a USB stick or otherwise still refuses, clear the download
+> quarantine flag directly:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/Vartalaap.app
+> ```
+>
+> **Windows** — SmartScreen shows "Windows protected your PC." Click **More
+> info** → **Run anyway**.
 >
 > Build from source if you would rather not take that on trust.
 
