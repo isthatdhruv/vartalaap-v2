@@ -86,7 +86,12 @@ jobs:
           args: ${{ matrix.args }}
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: "Vartalaap ${{ github.ref_name }}"
-          releaseDraft: true
+          # Published, not drafted: a tag is the decision to ship, and a draft
+          # is invisible to everyone but the repo owner — which reads as "the
+          # release has no downloads". Note the release therefore appears as
+          # soon as the first platform finishes and fills in over the next few
+          # minutes as the rest land.
+          releaseDraft: false
           prerelease: false
 
       - name: Upload installers as workflow artifacts
