@@ -47,7 +47,7 @@ to you: a campus, an office, a LAN party, a workshop, a flight's local Wi-Fi.
 - 🛡️ **Trust on first use (TOFU)** — peers' keys are pinned on first contact; a later key change
   is flagged with a warning
 - 🗄️ **Encrypted at rest** — contacts, groups, and conversation history persist locally, sealed
-  with a passphrase-derived key
+  with a key derived from a passphrase you set on first run and enter to unlock
 - 🖥️ **Cross-platform** — Linux, Windows, macOS, from one codebase
 
 ## How it works
@@ -88,7 +88,8 @@ Vartalaap is a small **Rust engine** (fully usable and tested headless) wrapped 
 - **Trust** is TOFU: a peer's key is pinned on first contact; a later key change is
   surfaced as a warning.
 - **At rest**, the local database is sealed with a key derived (Argon2id) from a
-  passphrase.
+  passphrase you choose on first run and enter at every launch. Nothing but that
+  passphrase opens it — there is no recovery path and no copy anywhere else.
 
 > **What "no server" means here:** Vartalaap is **LAN-only** by design. Two peers on the
 > same local network connect directly with zero infrastructure. Two peers on *different*
@@ -108,6 +109,16 @@ page (produced by CI for every platform), or build from source below.
 | **Older Linux** (Ubuntu 18.04 / 20.04, Debian 11) | **`.flatpak`** | `flatpak install --user ./Vartalaap.flatpak && flatpak run com.vartalaap.app` |
 | Windows 10/11 | `.exe` | run the installer (WebView2 is bootstrapped automatically) |
 | macOS | `.dmg` | open and drag to Applications |
+
+> **The installers are not code-signed** (that needs paid Apple/Microsoft
+> developer certificates), so the OS will object the first time:
+> - **macOS** — "Vartalaap can't be opened because it is from an unidentified
+>   developer." Right-click the app → **Open** → **Open**, or allow it under
+>   *System Settings → Privacy & Security*.
+> - **Windows** — SmartScreen shows "Windows protected your PC." Click **More
+>   info** → **Run anyway**.
+>
+> Build from source if you would rather not take that on trust.
 
 > **Linux support floor.** Tauri 2 requires `webkit2gtk-4.1`, which only ships on
 > ~2022+ distros — so the `.deb`/`.AppImage` need **Ubuntu 22.04+ / Debian 12+ /
@@ -181,6 +192,8 @@ vartalaap-v2/
 - [x] End-to-end-encrypted file transfer
 - [x] Desktop GUI (Linux / Windows / macOS)
 - [x] Offline message delivery (CRDT delta sync heals on reconnect)
+- [x] Passphrase-locked vault (identity, roster and history sealed at rest)
+- [ ] OS-keychain unlock ("remember me")
 - [ ] Voice / video calls
 - [ ] Multi-device identity
 - [ ] Optional internet transport (DHT + hole-punching) for cross-network use
@@ -190,8 +203,10 @@ vartalaap-v2/
 - **LAN-only** (by design) — see the security note above.
 - mDNS needs multicast on the network; some managed/enterprise Wi-Fi blocks it
   (a manual "add by ID" fallback is planned).
-- The desktop app currently unlocks the local store with a **placeholder passphrase** —
-  a real unlock screen / OS-keychain integration is on the list before any 1.0.
+- The installers are **unsigned**, so the OS will warn on first launch — see
+  [Install](#install). Signing needs paid developer certificates.
+- Your passphrase is asked for on **every launch**; there is no "remember me" yet
+  (it needs OS-keychain integration).
 - Group messages currently fan out pairwise (great privacy, more bandwidth) rather than
   using sender-keys — fine for small campus groups.
 

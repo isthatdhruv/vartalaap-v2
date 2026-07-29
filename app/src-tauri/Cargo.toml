@@ -1,6 +1,6 @@
 [package]
 name = "vartalaap-app"
-version = "0.3.0"
+version = "1.0.0"
 description = "Vartalaap — serverless, E2E-encrypted P2P campus chat"
 authors = ["Vartalaap"]
 edition = "2021"

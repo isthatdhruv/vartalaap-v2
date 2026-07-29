@@ -2651,6 +2651,54 @@ mod tests {
         Ok(())
     }
 
+    /// The whole point of the passphrase: chat history reloads for whoever
+    /// knows it, and stays sealed for whoever does not. Exercised through
+    /// `start_persistent`, the same entry point the desktop app's unlock
+    /// command calls, so the guarantee is tested where the app relies on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn history_reloads_only_under_the_right_passphrase() -> Result<()> {
+        let dir = tmp_data_dir("passphrase-history");
+        let peer: PeerKey = [77u8; 32];
+
+        {
+            let (alice, _rx) = Node::start_persistent(&dir, "open sesame").await?;
+            {
+                let mut st = alice.ctx.state.lock().unwrap();
+                st.conversations.entry(peer).or_default().create_text(
+                    alice.id(),
+                    now_millis(),
+                    "kept secret",
+                );
+            }
+            persist_convo(&alice.ctx, &peer);
+            alice.shutdown().await;
+        }
+
+        // Wrong passphrase: refused by name, and nothing is consumed by the
+        // attempt — the vault must survive being knocked on.
+        match Node::start_persistent(&dir, "open sesam").await {
+            Ok(_) => panic!("a wrong passphrase must not start the node"),
+            Err(e) => assert!(
+                matches!(
+                    e.downcast_ref::<crate::CoreError>(),
+                    Some(crate::CoreError::WrongPassphrase)
+                ),
+                "expected WrongPassphrase, got: {e}"
+            ),
+        }
+
+        // Right passphrase: the conversation is still there.
+        let (alice2, _rx2) = Node::start_persistent(&dir, "open sesame").await?;
+        assert_eq!(
+            alice2.conversation_bodies(&peer),
+            vec!["kept secret".to_string()],
+            "history must reload intact after a failed unlock attempt"
+        );
+        alice2.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
     /// `group_info_admits` is the admission gate for group metadata about a
     /// group we may not know yet (`GroupInvite` / `GroupAnnounce`). Unlike
     /// `group_allows` it judges the *claim*, since our roster has nothing to
