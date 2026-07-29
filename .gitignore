@@ -4,7 +4,7 @@
 # Cargo.lock IS committed. These crates build shipped binaries, so the lock
 # file is what makes a tagged release build the same dependency versions that
 # were tested, instead of whatever resolves on CI that day.
-
+vartalaap-v2.zip
 # Node
 node_modules
 dist
