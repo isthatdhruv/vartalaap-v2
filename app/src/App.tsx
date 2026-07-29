@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import Unlock from "./Unlock";
 import "./App.css";
 
 type WhoAmI = { id: string; fingerprint: string; display_name: string };
@@ -56,6 +57,9 @@ const glyph = (s: Message["status"]) =>
 
 export default function App() {
   const [me, setMe] = useState<WhoAmI | null>(null);
+  // Nothing below can talk to the engine until the vault is open, so every
+  // engine-touching effect waits on this.
+  const [unlocked, setUnlocked] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -112,6 +116,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!unlocked) return;
     invoke<WhoAmI>("whoami").then((w) => {
       setMe(w);
       setNameDraft(w.display_name);
@@ -194,7 +199,7 @@ export default function App() {
       clearInterval(poll);
       if (typingTimer.current) clearTimeout(typingTimer.current);
     };
-  }, [refreshRoster, refreshGroups, loadHistory, pushBanner]);
+  }, [unlocked, refreshRoster, refreshGroups, loadHistory, pushBanner]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -348,6 +353,18 @@ export default function App() {
       pushBanner({ kind: "error", text: `Remove contact failed: ${e}` });
     }
   };
+
+  if (!unlocked) {
+    return (
+      <Unlock
+        onUnlocked={(w) => {
+          setMe(w);
+          setNameDraft(w.display_name);
+          setUnlocked(true);
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app">
