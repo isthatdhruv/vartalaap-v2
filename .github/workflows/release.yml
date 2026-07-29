@@ -21,14 +21,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Built on 22.04 on purpose: it sets the glibc floor for the .deb and
+          # .AppImage, so they still start on Ubuntu 22.04 / Debian 12.
           - platform: ubuntu-22.04
             args: "--bundles deb,appimage"
+            targets: ""
           - platform: windows-latest
             args: "--bundles nsis"
-          - platform: macos-13 # Intel Macs
-            args: "--bundles dmg"
-          - platform: macos-14 # Apple Silicon Macs
-            args: "--bundles dmg"
+            targets: ""
+          # One universal .dmg covering Intel and Apple Silicon, rather than a
+          # per-architecture runner each. Same thing scripts/build-macos.sh
+          # produces, and it does not depend on the retired Intel runner image.
+          - platform: macos-14
+            args: "--target universal-apple-darwin --bundles dmg"
+            targets: "x86_64-apple-darwin,aarch64-apple-darwin"
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -44,6 +50,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -76,11 +84,13 @@ jobs:
         with:
           name: vartalaap-${{ matrix.platform }}
           if-no-files-found: ignore
+          # The macOS leg builds for an explicit target triple, so its bundle
+          # lands under target/<triple>/release rather than target/release.
           path: |
             app/src-tauri/target/release/bundle/deb/*.deb
             app/src-tauri/target/release/bundle/appimage/*.AppImage
             app/src-tauri/target/release/bundle/nsis/*.exe
-            app/src-tauri/target/release/bundle/dmg/*.dmg
+            app/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
 
   # Flatpak — the build that also runs on PRE-2022 Linux (Ubuntu 18.04/20.04,
   # Debian 11), where webkit2gtk-4.1 isn't available natively. The GNOME runtime
