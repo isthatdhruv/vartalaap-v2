@@ -40,7 +40,8 @@ to you: a campus, an office, a LAN party, a workshop, a flight's local Wi-Fi.
 - 📮 **Offline-safe delivery** — messages sent to an offline peer queue locally and heal
   automatically via CRDT delta sync on reconnect, with queued / sent / delivered status ticks
 - 🔒 **End-to-end encryption** (Olm/Double Ratchet) — forward secrecy + post-compromise security
-- 📡 **Automatic LAN discovery** (mDNS) — connect to a peer by identity alone, no IP addresses
+- 📡 **Automatic LAN discovery** (mDNS) — connect to a peer by identity alone, no IP addresses,
+  with a copy-paste connect code as a fallback for networks that block multicast
 - 📎 **Send any file** — arbitrary files, encrypted end-to-end, integrity-verified
 - 👤 **Cryptographic identity + profiles** — your public key *is* your identity ("Vartalaap ID");
   profiles exchange automatically on connect, with local aliases that override a peer's chosen name
@@ -88,8 +89,11 @@ Vartalaap is a small **Rust engine** (fully usable and tested headless) wrapped 
 - **Trust** is TOFU: a peer's key is pinned on first contact; a later key change is
   surfaced as a warning.
 - **At rest**, the local database is sealed with a key derived (Argon2id) from a
-  passphrase you choose on first run and enter at every launch. Nothing but that
-  passphrase opens it — there is no recovery path and no copy anywhere else.
+  passphrase you choose on first run. Nothing but that passphrase opens it —
+  there is no recovery path and no copy on any server. You can optionally have
+  it remembered in your OS credential store (macOS Keychain, Windows Credential
+  Manager, freedesktop Secret Service), which trades a prompt each launch for
+  "anyone who can log in as you can open the vault".
 
 > **What "no server" means here:** Vartalaap is **LAN-only** by design. Two peers on the
 > same local network connect directly with zero infrastructure. Two peers on *different*
@@ -205,20 +209,49 @@ vartalaap-v2/
 - [x] Desktop GUI (Linux / Windows / macOS)
 - [x] Offline message delivery (CRDT delta sync heals on reconnect)
 - [x] Passphrase-locked vault (identity, roster and history sealed at rest)
-- [ ] OS-keychain unlock ("remember me")
+- [x] OS-keychain unlock ("remember me")
+- [x] Connect by code when multicast discovery is blocked
 - [ ] Voice / video calls
 - [ ] Multi-device identity
 - [ ] Optional internet transport (DHT + hole-punching) for cross-network use
 
+## If two devices can't find each other
+
+Peers normally appear under **Nearby** within a few seconds. That relies on
+mDNS, which is multicast — and multicast is the first thing many networks throw
+away. If the list stays empty:
+
+**Use a connect code — this always works, and needs no discovery at all.**
+Click **+** next to *Nearby*, copy the code shown (`id@ip:port`), send it to the
+other person however you like, and have them paste it into the same panel. The
+two then dial each other directly over ordinary unicast QUIC. Nothing in the
+network has to cooperate beyond letting the two machines talk at all.
+
+Worth fixing anyway, so discovery works on its own:
+
+- **Windows Firewall.** The installer is unsigned, so Windows often never
+  prompts. In an Administrator PowerShell:
+  ```powershell
+  Get-NetConnectionProfile          # "Public" blocks discovery outright
+  Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private
+  New-NetFirewallRule -DisplayName "Vartalaap" -Direction Inbound `
+    -Program "C:\Program Files\Vartalaap\Vartalaap.exe" -Action Allow -Profile Any
+  ```
+- **IGMP snooping on your router.** Many consumer routers wrongly apply it to
+  `224.0.0.251` (mDNS), which is link-local and should always be flooded. It
+  breaks discovery most often between a wired and a wireless machine. Unless you
+  actually run IPTV multicast, turn **IGMP Snooping off**.
+- **Guest networks, AP isolation, and VPNs.** Check both machines are on the
+  same subnet (`ip addr` / `ipconfig`) — e.g. both `192.168.0.x`. Client
+  isolation on a guest SSID blocks peers from seeing each other by design.
+
 ## Known limitations
 
 - **LAN-only** (by design) — see the security note above.
-- mDNS needs multicast on the network; some managed/enterprise Wi-Fi blocks it
-  (a manual "add by ID" fallback is planned).
+- mDNS needs multicast; plenty of networks block it. There is a connect-code
+  fallback that works regardless — see [above](#if-two-devices-cant-find-each-other).
 - The installers are **unsigned**, so the OS will warn on first launch — see
   [Install](#install). Signing needs paid developer certificates.
-- Your passphrase is asked for on **every launch**; there is no "remember me" yet
-  (it needs OS-keychain integration).
 - Group messages currently fan out pairwise (great privacy, more bandwidth) rather than
   using sender-keys — fine for small campus groups.
 

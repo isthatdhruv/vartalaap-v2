@@ -566,6 +566,47 @@ impl Node {
         Ok(())
     }
 
+    /// Our connect code — `id@host:port,host:port` — everything a peer needs
+    /// to dial us directly.
+    ///
+    /// Discovery is mDNS, and mDNS is multicast, and multicast is the first
+    /// thing a campus network, a corporate VLAN, or a consumer router with
+    /// IGMP snooping switched on will throw away. When that happens the peer
+    /// list simply stays empty and there is nothing the user can do about it.
+    /// This is the way out: read the code off one screen, type or paste it
+    /// into the other, and the two dial each other over ordinary unicast QUIC
+    /// with discovery never involved.
+    pub fn connect_code(&self) -> String {
+        let addrs = self.ctx.transport.direct_addrs();
+        let id = hex::encode(self.id);
+        if addrs.is_empty() {
+            return id;
+        }
+        let list: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        format!("{id}@{}", list.join(","))
+    }
+
+    /// Dial a peer from a [`Node::connect_code`], bypassing discovery.
+    ///
+    /// A bare id (no `@`) is accepted too, and falls back to discovery — that
+    /// is still useful on a healthy network, and it means a user who copies
+    /// only half the string gets the best attempt we can make rather than a
+    /// parse error.
+    pub async fn connect_with_code(&self, code: &str) -> Result<PeerKey> {
+        let (peer, addrs) = parse_connect_code(code)?;
+        if peer == self.id {
+            return Err(anyhow!("that is this device's own code"));
+        }
+        let peer_id = peer_id_from_bytes(peer)?;
+        let conn = if addrs.is_empty() {
+            self.ctx.transport.connect_by_id(peer_id).await?
+        } else {
+            self.ctx.transport.connect_at(peer_id, &addrs).await?
+        };
+        setup_connection(conn, self.ctx.clone()).await?;
+        Ok(peer)
+    }
+
     /// Send a text: deliver on a live connection when possible (one dial
     /// attempt if needed), otherwise record locally as Queued — the message
     /// heals over via delta sync on the next connect.
@@ -1562,6 +1603,43 @@ fn offer_group_sync(ctx: &Arc<Ctx>, peer: PeerKey, gid: GroupId) {
         )
         .await;
     });
+}
+
+/// Split a connect code into the peer id and any addresses it carries.
+///
+/// Deliberately forgiving about shape, because this string gets copied out of
+/// one window and into another by hand: surrounding whitespace, a stray
+/// `vartalaap:` scheme prefix from a link, and an empty address list all
+/// parse rather than erroring. What it will not do is guess at a malformed
+/// id — a wrong key is a wrong peer, and failing loudly is the only safe
+/// answer.
+fn parse_connect_code(code: &str) -> Result<(PeerKey, Vec<std::net::SocketAddr>)> {
+    let code = code.trim();
+    let code = code.strip_prefix("vartalaap:").unwrap_or(code);
+    let (id_part, addr_part) = match code.split_once('@') {
+        Some((i, a)) => (i.trim(), a.trim()),
+        None => (code, ""),
+    };
+
+    let raw = hex::decode(id_part).map_err(|_| anyhow!("that is not a valid Vartalaap ID"))?;
+    let peer: PeerKey = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("a Vartalaap ID is 64 hex characters"))?;
+
+    let mut addrs = Vec::new();
+    for piece in addr_part.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        addrs.push(
+            piece
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| anyhow!("'{piece}' is not a host:port address"))?,
+        );
+    }
+    Ok((peer, addrs))
 }
 
 /// Membership gate for anything group-scoped: true only if `gid` names a
@@ -2696,6 +2774,77 @@ mod tests {
         );
         alice2.shutdown().await;
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// The connect code is typed and pasted by hand between two machines, so
+    /// the parser has to tolerate the mess that produces — while still
+    /// refusing anything it would have to guess at.
+    #[test]
+    fn connect_codes_parse_forgivingly_but_reject_bad_ids() {
+        let id = "aa".repeat(32);
+        let expect: PeerKey = [0xAA; 32];
+
+        // Bare id: legal, no addresses, caller falls back to discovery.
+        let (p, a) = parse_connect_code(&id).unwrap();
+        assert_eq!((p, a.len()), (expect, 0));
+
+        // Id plus one and several addresses.
+        let (p, a) = parse_connect_code(&format!("{id}@192.168.0.49:41234")).unwrap();
+        assert_eq!(p, expect);
+        assert_eq!(a, vec!["192.168.0.49:41234".parse().unwrap()]);
+        let (_, a) = parse_connect_code(&format!("{id}@192.168.0.49:41234,10.0.0.2:5000")).unwrap();
+        assert_eq!(a.len(), 2);
+
+        // Whitespace, a scheme prefix, and a trailing comma all survive.
+        let (p, a) =
+            parse_connect_code(&format!("  vartalaap:{id}@192.168.0.49:41234,  ")).unwrap();
+        assert_eq!((p, a.len()), (expect, 1));
+
+        // An id that is not 32 bytes, or not hex, is refused outright — a
+        // wrong key means a wrong peer.
+        assert!(parse_connect_code("nothex").is_err());
+        assert!(parse_connect_code(&"aa".repeat(31)).is_err());
+        // A malformed address is an error rather than a silent drop, so the
+        // user is told instead of quietly falling back to discovery.
+        assert!(parse_connect_code(&format!("{id}@192.168.0.49")).is_err());
+    }
+
+    /// The whole point of the code: two nodes connect with discovery playing
+    /// no part. Proven by dialing the code directly and exchanging a message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_code_works_without_discovery() -> Result<()> {
+        let (alice, _arx) = Node::start([171u8; 32]).await?;
+        let (bob, mut brx) = Node::start([172u8; 32]).await?;
+
+        let code = bob.connect_code();
+        assert!(
+            code.contains('@'),
+            "a bound node must advertise at least one address, got {code:?}"
+        );
+        assert!(code.starts_with(&hex::encode(bob.id())));
+
+        let peer = timeout(Duration::from_secs(20), alice.connect_with_code(&code))
+            .await
+            .map_err(|_| anyhow!("connect-by-code timed out"))??;
+        assert_eq!(peer, bob.id());
+
+        alice.send_text(bob.id(), "found you the hard way").await?;
+        assert_eq!(wait_message(&mut brx).await.body, "found you the hard way");
+        Ok(())
+    }
+
+    /// Pasting your own code is an easy mistake; it must say so rather than
+    /// dial itself and produce a confusing self-contact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn own_connect_code_is_rejected() -> Result<()> {
+        let (alice, _rx) = Node::start([173u8; 32]).await?;
+        let code = alice.connect_code();
+        let err = match alice.connect_with_code(&code).await {
+            Ok(_) => panic!("dialing our own code must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("own code"), "unhelpful error: {err}");
         Ok(())
     }
 

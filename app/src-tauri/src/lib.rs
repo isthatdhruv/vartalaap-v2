@@ -19,6 +19,42 @@ use vartalaap_core::{CoreError, Message, MessageKind};
 /// never re-judged — that would lock people out of their own data.
 const MIN_PASSPHRASE_LEN: usize = 8;
 
+/// Service name for the OS credential store (macOS Keychain, Windows
+/// Credential Manager, freedesktop Secret Service).
+const KEYRING_SERVICE: &str = "com.vartalaap.app";
+
+/// The keychain entry for one vault.
+///
+/// Keyed by data directory rather than a fixed name: two vaults on one login
+/// account (the `VARTALAAP_DATA_DIR` override used for running a second
+/// instance) must not fight over a single saved passphrase.
+fn keyring_entry(data_dir: &std::path::Path) -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, &data_dir.to_string_lossy()).ok()
+}
+
+/// Fetch a saved passphrase, if the user asked us to remember one.
+///
+/// Every failure here is soft. A keychain can be locked, absent (a headless
+/// Linux box with no Secret Service), or refused by the user at the OS prompt
+/// — none of which should stop them typing the passphrase in themselves.
+fn saved_passphrase(data_dir: &std::path::Path) -> Option<String> {
+    keyring_entry(data_dir)?.get_password().ok()
+}
+
+fn remember_passphrase(data_dir: &std::path::Path, passphrase: &str) -> Result<(), String> {
+    keyring_entry(data_dir)
+        .ok_or_else(|| "no OS credential store available on this system".to_string())?
+        .set_password(passphrase)
+        .map_err(|e| e.to_string())
+}
+
+fn forget_passphrase(data_dir: &std::path::Path) {
+    if let Some(e) = keyring_entry(data_dir) {
+        // Not-found is the expected case when nothing was ever saved.
+        let _ = e.delete_credential();
+    }
+}
+
 /// App-wide state. The node is optional because it does not exist until the
 /// vault is unlocked, and `unlock` is the only thing that ever fills it in.
 struct AppState {
@@ -80,6 +116,9 @@ struct VaultStatus {
     unlocked: bool,
     /// Surfaced so the UI can state the rule before the user submits.
     min_passphrase_len: usize,
+    /// Whether a passphrase is waiting in the OS credential store, so the UI
+    /// can offer to unlock without asking.
+    has_saved_passphrase: bool,
 }
 
 #[derive(Serialize)]
@@ -183,11 +222,43 @@ fn whoami_of(node: &Node) -> WhoAmI {
 
 #[tauri::command]
 fn vault_status(state: State<'_, AppState>) -> VaultStatus {
+    let exists = vartalaap_core::Engine::vault_exists(&state.data_dir);
     VaultStatus {
-        exists: vartalaap_core::Engine::vault_exists(&state.data_dir),
+        exists,
         unlocked: state.node().is_ok(),
         min_passphrase_len: MIN_PASSPHRASE_LEN,
+        // Only meaningful for a vault that exists; a saved passphrase for a
+        // deleted vault is stale and must not drive the UI.
+        has_saved_passphrase: exists && saved_passphrase(&state.data_dir).is_some(),
     }
+}
+
+/// Unlock using the passphrase held in the OS credential store.
+///
+/// A saved passphrase that no longer opens the vault is forgotten rather than
+/// retried forever — otherwise someone who changed it elsewhere would be stuck
+/// on a screen that fails every time it loads.
+#[tauri::command]
+async fn unlock_with_saved(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<WhoAmI, String> {
+    let Some(pw) = saved_passphrase(&state.data_dir) else {
+        return Err("no saved passphrase".to_string());
+    };
+    match unlock_inner(pw, false, &app, &state).await {
+        Ok(w) => Ok(w),
+        Err(e) => {
+            forget_passphrase(&state.data_dir);
+            Err(e)
+        }
+    }
+}
+
+/// Drop any saved passphrase, so the next launch asks again.
+#[tauri::command]
+fn forget_saved_passphrase(state: State<'_, AppState>) {
+    forget_passphrase(&state.data_dir);
 }
 
 /// Unlock (or, on first run, create) the vault and start the engine.
@@ -198,8 +269,18 @@ fn vault_status(state: State<'_, AppState>) -> VaultStatus {
 #[tauri::command]
 async fn unlock(
     passphrase: String,
+    remember: bool,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+) -> Result<WhoAmI, String> {
+    unlock_inner(passphrase, remember, &app, &state).await
+}
+
+async fn unlock_inner(
+    passphrase: String,
+    remember: bool,
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
 ) -> Result<WhoAmI, String> {
     let _guard = state.unlocking.lock().await;
     // A concurrent caller may have won the race while we waited.
@@ -222,6 +303,18 @@ async fn unlock(
             Some(CoreError::WrongPassphrase) => "Wrong passphrase.".to_string(),
             _ => e.to_string(),
         })?;
+
+    // Only now that the passphrase is proven good. Saving it on the way in
+    // would persist a wrong one. A keychain that refuses the write is not
+    // worth failing an otherwise-successful unlock over — the vault is open;
+    // the user simply gets asked again next time.
+    if remember {
+        if let Err(e) = remember_passphrase(&state.data_dir, &passphrase) {
+            eprintln!("vartalaap: could not save passphrase to the OS keychain: {e}");
+        }
+    } else {
+        forget_passphrase(&state.data_dir);
+    }
 
     let node = Arc::new(node);
     let me = node.id();
@@ -271,6 +364,22 @@ async fn connect(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let node = state.node()?;
     let key = parse_key(&id)?;
     node.connect(key).await.map_err(|e| e.to_string())
+}
+
+/// This device's connect code, for the case where mDNS never arrives.
+#[tauri::command]
+fn my_connect_code(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.node()?.connect_code())
+}
+
+/// Dial a peer from a pasted connect code, bypassing LAN discovery.
+#[tauri::command]
+async fn connect_by_code(code: String, state: State<'_, AppState>) -> Result<String, String> {
+    let node = state.node()?;
+    node.connect_with_code(&code)
+        .await
+        .map(|p| hexkey(&p))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -585,10 +694,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             vault_status,
             unlock,
+            unlock_with_saved,
+            forget_saved_passphrase,
             whoami,
             set_display_name,
             history,
             connect,
+            my_connect_code,
+            connect_by_code,
             send,
             send_file,
             save_file_as,

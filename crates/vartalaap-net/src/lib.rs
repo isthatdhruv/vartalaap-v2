@@ -139,10 +139,50 @@ impl IrohTransport {
             .with_ip_addr(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
     }
 
+    /// Every socket address this endpoint is currently reachable at.
+    ///
+    /// This is what makes the app usable on a network that eats multicast:
+    /// hand these to a peer out-of-band and they can dial straight at us,
+    /// without mDNS ever having to work. Loopback is filtered out — it is
+    /// never useful to a *different* machine, and only lengthens a string a
+    /// human may have to retype.
+    pub fn direct_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self
+            .endpoint
+            .addr()
+            .ip_addrs()
+            .filter(|s| !s.ip().is_loopback())
+            .copied()
+            .collect();
+        // Fall back to the bound sockets if the endpoint has not yet worked
+        // out its own addresses: a just-started node should still be able to
+        // print something dialable.
+        if addrs.is_empty() {
+            addrs = self
+                .endpoint
+                .bound_sockets()
+                .into_iter()
+                .filter(|s| !s.ip().is_loopback())
+                .collect();
+        }
+        // IPv4 first: it is the one people can read off a screen and type.
+        addrs.sort_by_key(|s| (s.is_ipv6(), s.to_string()));
+        addrs
+    }
+
     /// Dial a peer by address and return an open [`Conn`].
     pub async fn connect(&self, addr: PeerAddr) -> Result<Conn> {
         let conn = self.endpoint.connect(addr, ALPN).await.map_err(any)?;
         Ok(Conn { conn })
+    }
+
+    /// Dial a peer at explicitly-supplied addresses, skipping discovery.
+    pub async fn connect_at(&self, peer: PeerId, addrs: &[SocketAddr]) -> Result<Conn> {
+        let mut addr = EndpointAddr::new(peer);
+        for a in addrs {
+            addr = addr.with_ip_addr(*a);
+        }
+        self.connect(addr).await
     }
 
     /// Await the next incoming connection. Returns `None` when the endpoint is

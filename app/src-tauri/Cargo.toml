@@ -1,6 +1,6 @@
 [package]
 name = "vartalaap-app"
-version = "1.0.0"
+version = "1.0.1"
 description = "Vartalaap — serverless, E2E-encrypted P2P campus chat"
 authors = ["Vartalaap"]
 edition = "2021"
@@ -26,4 +26,5 @@ serde_json = "1"
 vartalaap-core = { path = "../../crates/vartalaap-core" }
 vartalaap-identity = { path = "../../crates/vartalaap-identity" }
 hex = "0.4"
+keyring = "4"
 
