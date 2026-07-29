@@ -253,6 +253,18 @@ impl Conn {
         }
     }
 
+    /// Tear this connection down immediately.
+    ///
+    /// Any task blocked in [`Self::accept_incoming`] on this connection (or on
+    /// a clone of it — `Conn` is a handle, so dropping one copy closes
+    /// nothing) wakes with an error and can stop servicing the peer. Callers
+    /// that have just severed a relationship need this: without it, a reader
+    /// loop holding its own clone keeps decoding and applying frames from a
+    /// peer the application has already forgotten.
+    pub fn close(&self) {
+        self.conn.close(0u32.into(), b"vartalaap: peer removed");
+    }
+
     /// Convenience for callers that only expect control frames.
     pub async fn recv_frame(&self) -> Result<Vec<u8>> {
         match self.accept_incoming().await? {
