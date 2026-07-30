@@ -34,3 +34,6 @@ graphify-out/
 # A 4.3 GB backup zip of this repo lives in the working tree. GitHub rejects
 # any file over 100 MB, so committing it would fail the push outright.
 *.zip
+
+# Written at build time from repository secrets when code signing is enabled.
+app/src-tauri/signing.conf.json

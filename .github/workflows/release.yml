@@ -1,11 +1,17 @@
 name: Release
 
-# Builds installers for every platform:
-#   - Linux:   .deb + .AppImage      (ubuntu runner)
-#   - Windows: .exe (NSIS installer)  (windows runner)
+# Builds every installer, plus SHA256SUMS:
+#   - Linux:   .deb + .AppImage (ubuntu-22.04, for the glibc floor)
+#   - Linux:   .flatpak         (also runs on pre-2022 distros)
+#   - Windows: .exe             (NSIS installer)
+#   - macOS:   .dmg             (universal — Intel + Apple Silicon)
 #
-# Trigger manually (Actions tab → Run workflow) to get downloadable artifacts,
-# or push a tag like `v0.1.0` to also attach them to a draft GitHub Release.
+# Trigger manually (Actions tab → Run workflow) for downloadable artifacts, or
+# push a `v*` tag to publish them as a GitHub Release.
+#
+# Code signing is opt-in and driven entirely by repository secrets; with none
+# set, macOS is ad-hoc signed (free, and required for Apple Silicon to run it
+# at all) and Windows is unsigned. See the "Code signing" section of README.md.
 
 on:
   workflow_dispatch:
@@ -71,6 +77,45 @@ jobs:
         working-directory: app
         run: npm ci
 
+      # Windows signing is opt-in and entirely secret-driven: with no
+      # certificate configured this writes nothing and the build proceeds
+      # exactly as it does today, unsigned. Kept out of tauri.conf.json
+      # deliberately — a thumbprint hardcoded there fails every build on every
+      # machine that does not hold that certificate, including local ones.
+      - name: Configure Windows code signing
+        id: winsign
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          if [ -z "$THUMBPRINT" ]; then
+            echo "::notice::No Windows signing certificate configured — the .exe will be unsigned."
+            echo "args=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$CERT" ]; then
+            echo "$CERT" | base64 --decode > cert.pfx
+            powershell -Command "Import-PfxCertificate -FilePath cert.pfx \
+              -CertStoreLocation Cert:\\CurrentUser\\My \
+              -Password (ConvertTo-SecureString -String '$CERT_PASSWORD' -Force -AsPlainText)"
+            rm -f cert.pfx
+          fi
+          cat > app/src-tauri/signing.conf.json <<JSON
+          {
+            "bundle": {
+              "windows": {
+                "certificateThumbprint": "$THUMBPRINT",
+                "digestAlgorithm": "sha256",
+                "timestampUrl": "http://timestamp.digicert.com"
+              }
+            }
+          }
+          JSON
+          echo "args=--config signing.conf.json" >> "$GITHUB_OUTPUT"
+
       - name: Build the app (Tauri)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -81,9 +126,30 @@ jobs:
           # Same two settings packaging/Dockerfile.ubuntu2204 needs.
           APPIMAGE_EXTRACT_AND_RUN: 1
           NO_STRIP: true
+
+          # --- macOS code signing -------------------------------------------
+          # Falls back to "-", which is codesign's ad-hoc identity: no
+          # certificate, no cost, no Apple account. That is not cosmetic on
+          # Apple Silicon, where the kernel refuses to execute a binary
+          # carrying no signature at all — an unsigned build is reported to
+          # the user as *damaged*, offering only "Move to Trash", which reads
+          # as "this download is malware" rather than "this developer has not
+          # paid Apple". Ad-hoc signing turns that into the ordinary
+          # unidentified-developer prompt they can click past.
+          #
+          # It is NOT notarization: Gatekeeper still warns. Set the secrets
+          # below to sign for real, and the same build notarizes too.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          # All inert while unset — tauri-action skips the keychain import and
+          # the notarization step when these are empty.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: app
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} ${{ steps.winsign.outputs.args }}
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: "Vartalaap ${{ github.ref_name }}"
           # Published, not drafted: a tag is the decision to ship, and a draft
@@ -175,3 +241,43 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ github.ref_name }}" Vartalaap.flatpak --clobber
+
+  # Publish SHA-256 sums alongside the installers.
+  #
+  # Without a paid certificate the OS cannot vouch for these downloads, but a
+  # published checksum still lets anyone confirm the file they got is byte-for-
+  # byte the one this workflow built. Verify with:
+  #   sha256sum -c SHA256SUMS --ignore-missing     (Linux)
+  #   shasum -a 256 -c SHA256SUMS --ignore-missing (macOS)
+  checksums:
+    needs: [build, flatpak]
+    # `always()` so a failed Flatpak leg still gets sums for everything else;
+    # gated on the build itself having produced something to hash.
+    if: always() && github.ref_type == 'tag' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every installer
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute SHA256SUMS
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.exe' \
+            -o -name '*.dmg' -o -name '*.flatpak' \) -print0 |
+          while IFS= read -r -d '' f; do
+            # Basename only: the artifact directory layout is an artifact of
+            # CI, not something a user downloading from the release sees.
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"
+          done | sort -k2 > ../SHA256SUMS
+          cd ..
+          test -s SHA256SUMS || { echo "no installers found to hash"; exit 1; }
+          cat SHA256SUMS
+
+      - name: Attach to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" SHA256SUMS --clobber
