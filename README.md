@@ -114,27 +114,43 @@ page (produced by CI for every platform), or build from source below.
 | Windows 10/11 | `.exe` | run the installer (WebView2 is bootstrapped automatically) |
 | macOS | `.dmg` | open and drag to Applications |
 
-> **The installers are not code-signed or notarized** (that needs paid
-> Apple/Microsoft developer certificates), so the OS will object the first time.
+> **The installers are not notarized or certificate-signed** (that needs paid
+> Apple/Microsoft developer credentials — see [Code signing](#code-signing)), so
+> the OS will object the first time.
 >
 > **macOS** — the `.dmg` is *universal*: one file that runs natively on both
-> Intel and Apple Silicon, macOS 10.13 or newer. But Gatekeeper will block it:
+> Intel and Apple Silicon, macOS 10.13 or newer. It is ad-hoc signed, so it
+> runs, but Gatekeeper does not know who built it:
 > 1. Drag Vartalaap to Applications and try to open it once. It will be refused.
 > 2. Open *System Settings → Privacy & Security*, scroll down, and click
 >    **Open Anyway** next to the message about Vartalaap.
 >
 > On **macOS 15 (Sequoia) and newer this is the only route** — Apple removed the
-> old Control-click → *Open* shortcut, so that no longer works. If the app was
-> copied off a USB stick or otherwise still refuses, clear the download
-> quarantine flag directly:
+> old Control-click → *Open* shortcut.
+>
+> If instead you are told the app is **damaged** and the only button is *Move to
+> Trash*, that is the quarantine flag, not actual damage. Clear it, and if it
+> still refuses, apply an ad-hoc signature by hand:
 > ```bash
-> xattr -dr com.apple.quarantine /Applications/Vartalaap.app
+> xattr -cr /Applications/Vartalaap.app
+> codesign --force --deep --sign - /Applications/Vartalaap.app
 > ```
+> (Versions before 1.0.2 shipped with no signature at all, which is what
+> produced that message on Apple Silicon. 1.0.2 and later are ad-hoc signed in
+> CI, so it should not recur.)
 >
 > **Windows** — SmartScreen shows "Windows protected your PC." Click **More
 > info** → **Run anyway**.
 >
-> Build from source if you would rather not take that on trust.
+> **Verify your download.** Every release ships a `SHA256SUMS` file. Nothing
+> vouches for the *publisher* without a certificate, but this does confirm the
+> bytes are the ones CI built:
+> ```bash
+> sha256sum -c SHA256SUMS --ignore-missing      # Linux
+> shasum -a 256 -c SHA256SUMS --ignore-missing  # macOS
+> ```
+>
+> Build from source if you would rather not take any of it on trust.
 
 > **Linux support floor.** Tauri 2 requires `webkit2gtk-4.1`, which only ships on
 > ~2022+ distros — so the `.deb`/`.AppImage` need **Ubuntu 22.04+ / Debian 12+ /
@@ -215,6 +231,48 @@ vartalaap-v2/
 - [ ] Multi-device identity
 - [ ] Optional internet transport (DHT + hole-punching) for cross-network use
 
+## Code signing
+
+Releases are **ad-hoc signed on macOS and unsigned on Windows**. Real signing
+is wired into `.github/workflows/release.yml` and switches on the moment the
+repository secrets below exist — no code change, just secrets. Nothing is
+hardcoded, so a fork without certificates still builds.
+
+Certificates are not free and are issued against a verified identity, which is
+why this is opt-in rather than done for you.
+
+**macOS** — [Apple Developer Program](https://developer.apple.com/programs/),
+$99/year. Create a *Developer ID Application* certificate, export it as `.p12`,
+and base64-encode it. Add:
+
+| Secret | What it is |
+|---|---|
+| `APPLE_CERTIFICATE` | the `.p12`, base64-encoded |
+| `APPLE_CERTIFICATE_PASSWORD` | its export password |
+| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_ID` | your Apple ID email |
+| `APPLE_PASSWORD` | an [app-specific password](https://support.apple.com/en-us/102654), *not* your Apple ID password |
+| `APPLE_TEAM_ID` | 10-character team ID |
+
+The last three enable **notarization**, which is what actually removes the
+Gatekeeper warning. Signing without notarizing does not.
+
+**Windows** — a code-signing certificate from a CA (~$200–600/year). Add
+`WINDOWS_CERTIFICATE_THUMBPRINT`, and `WINDOWS_CERTIFICATE` (base64 `.pfx`) plus
+`WINDOWS_CERTIFICATE_PASSWORD` if the key is exportable.
+
+> Since 2023 most OV certificates are issued on **hardware tokens** and cannot
+> be exported as a `.pfx` at all, which makes the thumbprint route unusable in
+> CI. The practical path is a cloud signing service —
+> [Azure Trusted Signing](https://azure.microsoft.com/en-us/products/trusted-signing)
+> is the cheapest — wired in through Tauri's
+> [`signCommand`](https://v2.tauri.app/distribute/sign/windows/) rather than a
+> thumbprint. Check what your CA issues before buying.
+
+**Linux** — `.deb` and `.AppImage` are distributed with checksums rather than
+signatures; Flatpak repos are GPG-signed only when hosted as a repo, which this
+project does not do (it ships a single-file bundle).
+
 ## If two devices can't find each other
 
 Peers normally appear under **Nearby** within a few seconds. That relies on
@@ -250,8 +308,9 @@ Worth fixing anyway, so discovery works on its own:
 - **LAN-only** (by design) — see the security note above.
 - mDNS needs multicast; plenty of networks block it. There is a connect-code
   fallback that works regardless — see [above](#if-two-devices-cant-find-each-other).
-- The installers are **unsigned**, so the OS will warn on first launch — see
-  [Install](#install). Signing needs paid developer certificates.
+- **Not notarized or certificate-signed**, so the OS warns on first launch — see
+  [Install](#install) and [Code signing](#code-signing). macOS builds are ad-hoc
+  signed, which is what lets them run on Apple Silicon at all.
 - Group messages currently fan out pairwise (great privacy, more bandwidth) rather than
   using sender-keys — fine for small campus groups.
 
