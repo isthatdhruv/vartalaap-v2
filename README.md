@@ -135,9 +135,10 @@ page (produced by CI for every platform), or build from source below.
 > xattr -cr /Applications/Vartalaap.app
 > codesign --force --deep --sign - /Applications/Vartalaap.app
 > ```
-> (Versions before 1.0.2 shipped with no signature at all, which is what
-> produced that message on Apple Silicon. 1.0.2 and later are ad-hoc signed in
-> CI, so it should not recur.)
+> (Versions up to and including 1.0.2 shipped with no signature at all, which
+> is what produced that message on Apple Silicon. 1.0.3 and later are ad-hoc
+> signed in CI, so it should not recur. Note 1.0.2 has no macOS build at all —
+> its signing change broke that leg, which 1.0.3 fixes.)
 >
 > **Windows** — SmartScreen shows "Windows protected your PC." Click **More
 > info** → **Run anyway**.

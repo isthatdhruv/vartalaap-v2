@@ -116,6 +116,59 @@ jobs:
           JSON
           echo "args=--config signing.conf.json" >> "$GITHUB_OUTPUT"
 
+      # macOS signing must be configured by *defining or not defining* the
+      # variables, never by passing them through empty.
+      #
+      # `env: APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}` with no such
+      # secret does not leave the variable unset — it sets it to "". Tauri's
+      # bundler tests whether the variable exists, not whether it has content,
+      # so it ran `security import` on empty certificate data and the whole
+      # macOS build died with "SecKeychainItemImport: parameters not valid".
+      # Writing to $GITHUB_ENV is the only way to leave a name genuinely absent.
+      - name: Configure macOS code signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          A_ID: ${{ secrets.APPLE_ID }}
+          A_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          A_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERT" ]; then
+            # No certificate: ad-hoc sign. "-" is codesign's ad-hoc identity —
+            # free, no Apple account. Not cosmetic on Apple Silicon, where the
+            # kernel refuses to execute a binary with no signature at all, so
+            # an unsigned build is reported as *damaged* with only "Move to
+            # Trash" offered. Ad-hoc signing turns that into the ordinary
+            # unidentified-developer prompt. It is NOT notarization.
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            echo "::notice::No Apple certificate configured — ad-hoc signing the .app."
+            exit 0
+          fi
+          # Multi-line safe: a base64 .p12 may or may not be wrapped.
+          {
+            echo "APPLE_CERTIFICATE<<__VARTALAAP_EOF__"
+            echo "$CERT"
+            echo "__VARTALAAP_EOF__"
+            echo "APPLE_CERTIFICATE_PASSWORD=$CERT_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$IDENTITY"
+          } >> "$GITHUB_ENV"
+          # Notarization is what actually clears the Gatekeeper warning, and
+          # needs all three. Partial credentials would fail the build, so it is
+          # all-or-nothing.
+          if [ -n "$A_ID" ] && [ -n "$A_PASSWORD" ] && [ -n "$A_TEAM_ID" ]; then
+            {
+              echo "APPLE_ID=$A_ID"
+              echo "APPLE_PASSWORD=$A_PASSWORD"
+              echo "APPLE_TEAM_ID=$A_TEAM_ID"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::Signing without notarizing — Gatekeeper will still warn."
+          fi
+
       - name: Build the app (Tauri)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -126,27 +179,8 @@ jobs:
           # Same two settings packaging/Dockerfile.ubuntu2204 needs.
           APPIMAGE_EXTRACT_AND_RUN: 1
           NO_STRIP: true
-
-          # --- macOS code signing -------------------------------------------
-          # Falls back to "-", which is codesign's ad-hoc identity: no
-          # certificate, no cost, no Apple account. That is not cosmetic on
-          # Apple Silicon, where the kernel refuses to execute a binary
-          # carrying no signature at all — an unsigned build is reported to
-          # the user as *damaged*, offering only "Move to Trash", which reads
-          # as "this download is malware" rather than "this developer has not
-          # paid Apple". Ad-hoc signing turns that into the ordinary
-          # unidentified-developer prompt they can click past.
-          #
-          # It is NOT notarization: Gatekeeper still warns. Set the secrets
-          # below to sign for real, and the same build notarizes too.
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
-          # All inert while unset — tauri-action skips the keychain import and
-          # the notarization step when these are empty.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple variables come from the step above, via $GITHUB_ENV, so that
+          # absent credentials mean absent variables rather than empty ones.
         with:
           projectPath: app
           args: ${{ matrix.args }} ${{ steps.winsign.outputs.args }}
@@ -188,8 +222,14 @@ jobs:
     # downloaded from the `build` job rather than recompiled here, which keeps
     # the glibc floor *and* saves six minutes of duplicate work.
     runs-on: ubuntu-24.04
-    # Also orders us after the draft release exists, for the upload below.
+    # Ordering only — `always()` so one broken platform does not take the
+    # Flatpak down with it. v1.0.2 lost both the Flatpak and the checksums to a
+    # macOS failure that had nothing to do with either, because a single failed
+    # matrix leg fails the whole `build` job. This job needs exactly one thing
+    # from it: the Linux .deb, and the download step below fails loudly if that
+    # is missing.
     needs: build
+    if: always() && needs.build.result != 'cancelled'
     permissions:
       contents: write
     steps:
@@ -251,9 +291,11 @@ jobs:
   #   shasum -a 256 -c SHA256SUMS --ignore-missing (macOS)
   checksums:
     needs: [build, flatpak]
-    # `always()` so a failed Flatpak leg still gets sums for everything else;
-    # gated on the build itself having produced something to hash.
-    if: always() && github.ref_type == 'tag' && needs.build.result == 'success'
+    # Sums whatever actually got built. Requiring the whole `build` job to
+    # succeed meant one failed platform left the release with no checksums for
+    # the platforms that were fine — the Compute step below fails if there is
+    # genuinely nothing to hash.
+    if: always() && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
