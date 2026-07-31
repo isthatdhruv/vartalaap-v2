@@ -280,7 +280,11 @@ jobs:
         if: github.ref_type == 'tag'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" Vartalaap.flatpak --clobber
+        # `--repo` is redundant here (this job does check out) but costs
+        # nothing and stops the command breaking if the checkout ever goes.
+        run: |
+          gh release upload "${{ github.ref_name }}" Vartalaap.flatpak \
+            --repo "${{ github.repository }}" --clobber
 
   # Publish SHA-256 sums alongside the installers.
   #
@@ -319,7 +323,14 @@ jobs:
           test -s SHA256SUMS || { echo "no installers found to hash"; exit 1; }
           cat SHA256SUMS
 
+      # `--repo` because this job deliberately does not check the source out —
+      # it only needs the built artifacts. Without either a checkout or this
+      # flag, gh has no git remote to infer the repository from and exits with
+      # "fatal: not a git repository", which is exactly how v1.0.3 lost its
+      # checksums after computing them correctly.
       - name: Attach to the release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" SHA256SUMS --clobber
+        run: |
+          gh release upload "${{ github.ref_name }}" SHA256SUMS \
+            --repo "${{ github.repository }}" --clobber
